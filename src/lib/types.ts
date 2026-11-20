@@ -27,14 +27,13 @@ import type {
   ListPromptsResult,
   GetPromptRequest,
   GetPromptResult,
+  CompleteRequestParams,
+  CompleteResult,
   SubscribeRequest,
   UnsubscribeRequest,
   LoggingLevel,
   ListResourceTemplatesResult,
   Task,
-  GetTaskResult,
-  ListTasksResult,
-  CancelTaskResult,
 } from '@modelcontextprotocol/client';
 
 /**
@@ -67,13 +66,12 @@ export type {
   ListPromptsResult,
   GetPromptRequest,
   GetPromptResult,
+  CompleteRequestParams,
+  CompleteResult,
   SubscribeRequest,
   UnsubscribeRequest,
   LoggingLevel,
   Task,
-  GetTaskResult,
-  ListTasksResult,
-  CancelTaskResult,
 };
 
 /** Keepalive ping interval in milliseconds (30 seconds) */
@@ -105,7 +103,7 @@ export interface ServerConfig {
   headers?: Record<string, string>; // For http transport
   command?: string; // Mandatory for stdio transport
   args?: string[]; // For stdio transport
-  env?: Record<string, string>; // Environment variables for stdio transport
+  env?: Record<string, string>; // Environment variables for stdio transport (values live in the keychain; redacted in sessions.json)
   timeout?: number; // Request timeout in SECONDS (field name kept as `timeout` for mcp.json / sessions.json compatibility)
   protocolVersion?: string; // Pin the MCP protocol version (strict, no fallback; absent = auto-negotiate)
 }
@@ -172,7 +170,7 @@ export interface SessionNotifications {
  */
 export interface SessionData {
   name: string;
-  server: ServerConfig; // Transport configuration (header values redacted to "<redacted>")
+  server: ServerConfig; // Transport configuration (header and stdio env values redacted to "<redacted>")
   profileName?: string; // Name of auth profile (for OAuth servers)
   /**
    * x402 auto-payment scheme preference. Presence enables x402 for the session;
@@ -302,6 +300,14 @@ export interface AuthProfile {
   oauthGrant?: OAuthGrant;
   // OAuth metadata
   oauthIssuer: string;
+  /**
+   * RFC 8707 resource indicator the login sent to the authorization server (the MCP
+   * server's canonical URL, as selected via its protected resource metadata). Token
+   * refresh repeats it: servers that bind tokens to a resource reject a refresh
+   * without it (#395). Absent when the login sent none, or for profiles written
+   * before mcpc recorded it.
+   */
+  oauthResource?: string;
   /** Enterprise IdP issuer URL (id_jag grant only). */
   idpIssuer?: string;
   scopes?: string[];
@@ -348,6 +354,12 @@ export interface IdJagCredentials {
   mcpClientId: string;
   /** Secret for the MCP authorization server client (required by the SDK provider). */
   mcpClientSecret: string;
+  /**
+   * Authorization server of the MCP server, as discovered at login (RFC 9728). The SDK
+   * provider is bound to it (SEP-2352), so the MCP client secret is only ever sent
+   * there. Absent for profiles written before mcpc recorded it; re-login records it.
+   */
+  mcpAuthorizationServer?: string;
   /** Space-separated scopes requested for the MCP server. */
   scope?: string;
 }
@@ -387,15 +399,30 @@ export interface AuthCredentials {
    * recorded the issuer.
    */
   oauthIssuer?: string;
+  /**
+   * RFC 8707 resource indicator the login sent (`AuthProfile.oauthResource`), repeated
+   * on token refresh. Absent when the login sent none or the profile predates it; the
+   * bridge then derives it from the server's protected resource metadata.
+   */
+  oauthResource?: string;
   // Client-credentials grant material (machine-to-machine; sent via IPC, never CLI args)
   privateKeyPem?: string; // private_key_jwt variant (RFC 7523): PEM-encoded signing key
   keyAlg?: string; // JWT signing algorithm for the private_key_jwt variant (e.g. RS256)
   scope?: string; // space-separated scopes requested by the client-credentials grant
   tokenEndpoint?: string; // explicit token endpoint (--token-endpoint); bypasses discovery
+  /**
+   * Authorization server the client-credentials material is bound to (SEP-2352), as
+   * recorded by `login` (`OAuthClientCredentialsInfo.issuer`). Absent for profiles
+   * written before mcpc recorded it.
+   */
+  clientCredentialsIssuer?: string;
   // Enterprise-managed authorization material (id_jag grant; sent via IPC, never CLI args)
   idJag?: IdJagCredentials;
   // HTTP headers (from --header flags, stored in keychain)
   headers?: Record<string, string>;
+  // Environment variables for a stdio server (from the config entry's `env`, stored in
+  // keychain). Delivered over IPC so the resolved values never appear in the bridge's argv.
+  env?: Record<string, string>;
   // Bearer token the bridge's proxy server requires (from --proxy-bearer-token).
   // Read by the CLI before spawn and delivered via IPC so the bridge never reads it
   // from the keychain itself — keeping the bridge's only keychain access on the
@@ -412,17 +439,160 @@ export interface X402WalletCredentials {
 }
 
 /**
+ * Lifecycle states of a task. Identical in the 2025-11-25 core protocol and the
+ * 2026-07-28 `io.modelcontextprotocol/tasks` extension.
+ */
+export type TaskStatus = Task['status'];
+
+/** The JSON-RPC error a `failed` task carries (2026-07-28 tasks extension). */
+export interface TaskError {
+  code: number;
+  message: string;
+  data?: unknown;
+}
+
+/**
+ * A task as the `io.modelcontextprotocol/tasks` extension (MCP 2026-07-28) shapes it: the
+ * flat `Task` fields plus the status-specific payload that `tasks/get` inlines — `result`
+ * once completed, `error` once failed, `inputRequests` while the server waits for input.
+ * `CreateTaskResult`, the `tasks/get` result and `notifications/tasks` all carry this
+ * shape (the wire `resultType` discriminator is stripped before it reaches mcpc).
+ *
+ * The 2025-11-25 core protocol's `Task` (imported from the SDK above) differs in field
+ * names (`ttl`/`pollInterval`) and never inlines the result — `tasks/result` fetches it.
+ *
+ * Spec: https://github.com/modelcontextprotocol/ext-tasks/blob/main/specification/2026-07-28/tasks.md
+ */
+export interface ExtensionTask {
+  taskId: string;
+  status: TaskStatus;
+  statusMessage?: string;
+  /** ISO 8601 */
+  createdAt: string;
+  /** ISO 8601 */
+  lastUpdatedAt: string;
+  /** Time-to-live from creation in milliseconds; `null` means unlimited. */
+  ttlMs: number | null;
+  /** Polling interval the server asks clients to honor, in milliseconds. */
+  pollIntervalMs?: number;
+  /** The original request's result (a `CallToolResult` for `tools/call`); status `completed` only. */
+  result?: Record<string, unknown>;
+  /** The JSON-RPC error that failed the task; status `failed` only. */
+  error?: TaskError;
+  /** Outstanding server-to-client requests, keyed by id; status `input_required` only. */
+  inputRequests?: Record<string, unknown>;
+  /** Anything else the server attached (for example `_meta`) passes through. */
+  [key: string]: unknown;
+}
+
+/**
+ * A task in whichever shape the connection's protocol era uses: the SDK's 2025-11-25
+ * `Task`, or the extension's {@link ExtensionTask}. Everything mcpc prints about a task —
+ * id, status, message, timestamps — is common to both.
+ */
+export type AnyTask = Task | ExtensionTask;
+
+/**
+ * Whether a task came from the 2026-07-28 extension. Every normalized {@link ExtensionTask}
+ * carries `ttlMs`, and the 2025 core `Task` never does (the SDK's schema strips unknown
+ * fields), so that field alone decides — whatever else a server attached, `ttl` included.
+ */
+export function isExtensionTask(task: AnyTask): task is ExtensionTask {
+  return 'ttlMs' in task;
+}
+
+/**
+ * One page of tasks: the server's `tasks/list` on 2025-11-25 connections, or — since the
+ * extension defines no listing — the tasks this session created on 2026-07-28 ones.
+ */
+export interface TasksPage {
+  tasks: AnyTask[];
+  nextCursor?: string | undefined;
+}
+
+/**
+ * What a detached tool call (`tools-call --detach`) produced. Exactly one field is set:
+ * the task the server created, or the tool result when a 2026-07-28 server — which
+ * decides per call whether to create a task — answered synchronously instead.
+ */
+export interface DetachedToolCall {
+  task?: AnyTask;
+  result?: CallToolResult;
+}
+
+/**
  * Task status update sent from bridge to CLI during task-augmented tool calls
  */
 export interface TaskUpdate {
   taskId: string;
-  status: 'working' | 'input_required' | 'completed' | 'failed' | 'cancelled';
+  status: TaskStatus;
   statusMessage?: string;
   progressMessage?: string; // Message from notifications/progress
   progress?: number; // Current progress value from notifications/progress
   progressTotal?: number; // Total progress value from notifications/progress
   createdAt?: string;
   lastUpdatedAt?: string;
+}
+
+/**
+ * A file belonging to a skill, with the digest and size of its content
+ * (`io.modelcontextprotocol/skills`).
+ */
+export interface SkillResource {
+  /** Resource URI of the file. */
+  uri: string;
+  /** SHA-256 digest of the file's raw bytes, as `sha256:<64 lowercase hex chars>`. */
+  digest: string;
+  /** Length in bytes of the file's raw content — the same bytes `digest` covers. */
+  size: number;
+}
+
+/**
+ * The entry for a single skill, as returned by `skills/list` and `skills/get`.
+ * Identical in shape and meaning in each.
+ */
+export interface Skill {
+  /** Resource URI of the skill's SKILL.md, readable via `resources/read`. */
+  uri: string;
+  /**
+   * The skill's SKILL.md YAML frontmatter, verbatim. `name` and `description` are
+   * always present; every other field the author wrote passes through unchanged.
+   */
+  frontmatter: {
+    name: string;
+    description: string;
+    [key: string]: unknown;
+  };
+  /**
+   * The skill's complete file manifest (SKILL.md included), or the string `"dynamic"`
+   * when the content is generated such that stable digests cannot be published.
+   */
+  resources: SkillResource[] | 'dynamic';
+  /** Keys defined by the extension use the `io.modelcontextprotocol.skills/` prefix. */
+  _meta?: Record<string, unknown>;
+}
+
+/** Result of `skills/list` (paginated; `ttlMs`/`cacheScope` are the caching hints). */
+export interface ListSkillsResult {
+  skills: Skill[];
+  nextCursor?: string;
+  ttlMs?: number;
+  cacheScope?: string;
+}
+
+/** Result of `skills/get`. */
+export interface GetSkillResult {
+  skill: Skill;
+  ttlMs?: number;
+  cacheScope?: string;
+}
+
+/** Result of `resources/directory/read` (paginated; `ttlMs`/`cacheScope` are the caching hints). */
+export interface ReadResourceDirectoryResult {
+  resources: Resource[];
+  nextCursor?: string;
+  ttlMs?: number;
+  cacheScope?: string;
 }
 
 /**
@@ -574,11 +744,29 @@ export interface IMcpClient {
   // Note: resource subscriptions (resources-subscribe/-unsubscribe) are not part of this
   // interface — they sync files via the persistent bridge process and live on SessionClient.
   // McpClient keeps the raw protocol ops (subscribeResource/unsubscribeResource) for the bridge.
+  /**
+   * Skills extension (`io.modelcontextprotocol/skills`): list the skills the server
+   * serves, get one skill's entry by the URI of its SKILL.md, and read a directory
+   * resource's direct children. All three require the server to declare the extension
+   * (the last one additionally `directoryRead: true`) on a 2026-07-28+ connection.
+   */
+  listSkills(cursor?: string): Promise<ListSkillsResult>;
+  getSkill(uri: string): Promise<GetSkillResult>;
+  readResourceDirectory(uri: string, cursor?: string): Promise<ReadResourceDirectoryResult>;
   listPrompts(cursor?: string): Promise<ListPromptsResult>;
   getPrompt(name: string, args?: Record<string, string>): Promise<GetPromptResult>;
+  /**
+   * Ask the server to suggest values for a prompt argument or resource-template variable
+   * (`completion/complete`). Requires the server to declare the `completions` capability.
+   */
+  complete(params: CompleteRequestParams): Promise<CompleteResult>;
   setLoggingLevel(level: LoggingLevel): Promise<void>;
 
-  // Task operations (async tool execution)
+  /**
+   * Task operations (async tool execution). Era-aware: the 2025-11-25 core `tasks/*`
+   * requests on legacy connections, the `io.modelcontextprotocol/tasks` extension on
+   * 2026-07-28 ones — see McpClient for the differences.
+   */
   callToolWithTask(
     name: string,
     args?: Record<string, unknown>,
@@ -589,10 +777,10 @@ export interface IMcpClient {
     name: string,
     args?: Record<string, unknown>,
     meta?: Record<string, unknown>
-  ): Promise<TaskUpdate>;
+  ): Promise<DetachedToolCall>;
   pollTask(taskId: string, onUpdate?: (update: TaskUpdate) => void): Promise<CallToolResult>;
-  listTasks(cursor?: string): Promise<ListTasksResult>;
-  getTask(taskId: string): Promise<GetTaskResult>;
+  listTasks(cursor?: string): Promise<TasksPage>;
+  getTask(taskId: string): Promise<AnyTask>;
   getTaskResult(taskId: string): Promise<CallToolResult>;
-  cancelTask(taskId: string): Promise<CancelTaskResult>;
+  cancelTask(taskId: string): Promise<AnyTask>;
 }

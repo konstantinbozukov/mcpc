@@ -9,23 +9,29 @@
  *   PAGINATION_SIZE - items per page, 0 = no pagination (default: 0)
  *   LATENCY_MS - artificial latency in ms (default: 0)
  *   REQUIRE_AUTH - require Authorization header (default: false)
+ *   EXPECTED_BEARER_TOKEN - with REQUIRE_AUTH, the exact token to demand (default: any)
  *   NO_TOOLS - disable tools capability (default: false)
  *   NO_TASKS - serve tools but withhold the tasks capability, so --task/--detach
  *     must be refused rather than silently run synchronously (default: false)
  *   NO_RESOURCES - disable resources capability (default: false)
  *   NO_PROMPTS - disable prompts capability (default: false)
- *   WITH_SKILLS - enable the io.modelcontextprotocol/skills extension and
- *     expose skill:// resources (default: false; opt-in to avoid skewing
- *     resource counts in non-skills tests)
- *   SKILLS_NO_INDEX - serve skill files but no skill://index.json (default: false,
- *     used to exercise the resource-scan fallback path; only meaningful when
- *     WITH_SKILLS=true)
+ *   NO_COMPLETIONS - withhold the completions capability, so completion-complete
+ *     must be refused client-side instead of sent (default: false)
+ *   WITH_SKILLS - declare the io.modelcontextprotocol/skills extension and expose
+ *     the skill:// files as ordinary resources (default: false). The extension's
+ *     own methods are 2026-07-28-only and live in index-v2.ts; serving them here
+ *     would invent a dialect no server promises — this server exists so tests can
+ *     prove the client refuses skills on a legacy connection.
+ *   WITH_OTHER_EXTENSIONS - also declare extensions mcpc does not implement (MCP Apps)
+ *     and one vendor extension it cannot know, so tests can pin how they are reported
+ *     (default: false)
  *
  * Control endpoints (for test manipulation):
  *   GET  /health - health check
  *   GET  /control/get-deleted-sessions - list session IDs that received DELETE
  *   GET  /control/get-active-sessions - list active MCP session IDs
  *   GET  /control/get-subscriptions - resource URIs subscribed per session
+ *   GET  /control/get-client-capabilities - capabilities the client declared (latest tools/call)
  *   POST /control/fail-next?count=N - fail next N MCP requests
  *   POST /control/expire-session - expire current session
  *   POST /control/bump-counter - increment test://dynamic/counter + notify subscribers
@@ -44,6 +50,7 @@ import {
   UnsubscribeRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  CompleteRequestSchema,
   ListResourceTemplatesRequestSchema,
   GetTaskRequestSchema,
   GetTaskPayloadRequestSchema,
@@ -64,6 +71,7 @@ import {
   callTestTool,
   readTestResource,
   getTestPrompt,
+  completeTestArgument,
   handleOAuthEndpoints,
 } from './fixtures.js';
 
@@ -72,13 +80,17 @@ const PORT = parseInt(process.env.PORT || '13456', 10);
 const PAGINATION_SIZE = parseInt(process.env.PAGINATION_SIZE || '0', 10);
 const LATENCY_MS = parseInt(process.env.LATENCY_MS || '0', 10);
 const REQUIRE_AUTH = process.env.REQUIRE_AUTH === 'true';
+// With REQUIRE_AUTH, demand this exact bearer token rather than any well-formed one,
+// so a test can prove a credential survived storage byte for byte.
+const EXPECTED_BEARER_TOKEN = process.env.EXPECTED_BEARER_TOKEN || '';
 const NO_TOOLS = process.env.NO_TOOLS === 'true';
 // Serve tools but withhold the tasks capability, so `--task`/`--detach` must refuse
 const NO_TASKS = process.env.NO_TASKS === 'true';
 const NO_RESOURCES = process.env.NO_RESOURCES === 'true';
 const NO_PROMPTS = process.env.NO_PROMPTS === 'true';
+const NO_COMPLETIONS = process.env.NO_COMPLETIONS === 'true';
 const WITH_SKILLS = process.env.WITH_SKILLS === 'true';
-const SKILLS_NO_INDEX = process.env.SKILLS_NO_INDEX === 'true';
+const WITH_OTHER_EXTENSIONS = process.env.WITH_OTHER_EXTENSIONS === 'true';
 // OAuth client-credentials grant test endpoints (metadata + /token). Opt-in so
 // other suites are unaffected. Expected credentials default to test values.
 const WITH_OAUTH = process.env.WITH_OAUTH === 'true';
@@ -96,21 +108,24 @@ const deletedSessions: string[] = [];
 // Mutable counter resource state (bumped via /control/bump-counter)
 let counterValue = 0;
 
+// Client capabilities in effect for the latest tools/call (declared in `initialize`),
+// so tests can check what mcpc advertises on the wire
+let lastClientCapabilities: unknown = null;
+
 // Resource URIs subscribed per MCP server instance (resources/subscribe)
 const serverSubscriptions = new WeakMap<Server, Set<string>>();
 
 // The task-augmented slow-task tool advertises optional task support
-// (2025-11-25 experimental tasks — v1 server only; tasks moved to an
-// extension in 2026-07-28 that the v2 SDK does not implement yet).
+// (2025-11-25 experimental tasks — v1 server only; in 2026-07-28 tasks are the
+// io.modelcontextprotocol/tasks extension, which index-v2.ts serves, and the
+// per-tool `execution` hint no longer exists).
 const V1_TOOLS = TOOLS.map((tool) =>
   tool.name === 'slow-task' ? { ...tool, execution: { taskSupport: 'optional' as const } } : tool
 );
 
 // Compute the effective skills resource list and content map at startup.
-const { resources: SKILLS_RESOURCES, contents: SKILL_CONTENTS } = computeSkillsFixtures(
-  WITH_SKILLS,
-  SKILLS_NO_INDEX
-);
+const { resources: SKILLS_RESOURCES, contents: SKILL_CONTENTS } =
+  computeSkillsFixtures(WITH_SKILLS);
 
 // Helper for artificial latency
 async function maybeDelay(): Promise<void> {
@@ -161,20 +176,26 @@ function createMcpServer(): Server {
   if (!NO_PROMPTS) {
     capabilities.prompts = { listChanged: true };
   }
-  // Advertise the experimental skills extension when skill resources are exposed.
-  // SEP-2640 specifies `capabilities.extensions`, but current MCP SDKs strip
-  // unknown capability fields. We also publish under `capabilities.experimental`
-  // (the standard SDK-preserved escape hatch) so clients can detect the
-  // extension today regardless of SDK version.
+  if (!NO_COMPLETIONS) {
+    capabilities.completions = {};
+  }
+  // Declare the skills extension, as an out-of-era server might. Its methods are
+  // not served here (see the header) — the client is expected to refuse them on a
+  // 2025-era connection rather than try.
   if (WITH_SKILLS && !NO_RESOURCES) {
-    const SKILLS_KEY = 'io.modelcontextprotocol/skills';
     capabilities.extensions = {
       ...((capabilities.extensions as Record<string, unknown>) || {}),
-      [SKILLS_KEY]: {},
+      'io.modelcontextprotocol/skills': {},
     };
-    capabilities.experimental = {
-      ...((capabilities.experimental as Record<string, unknown>) || {}),
-      [SKILLS_KEY]: {},
+  }
+
+  // Extensions beyond the ones mcpc implements. A server declares what it serves on its
+  // own terms, so the client has to name these without offering commands for them.
+  if (WITH_OTHER_EXTENSIONS) {
+    capabilities.extensions = {
+      ...((capabilities.extensions as Record<string, unknown>) || {}),
+      'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] },
+      'com.example/widgets': {},
     };
   }
 
@@ -205,6 +226,7 @@ function createMcpServer(): Server {
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      lastClientCapabilities = server.getClientCapabilities() ?? null;
       await maybeDelay();
       if (shouldFail()) {
         throw new Error('Simulated failure');
@@ -419,6 +441,24 @@ function createMcpServer(): Server {
     });
   } // end if (!NO_PROMPTS)
 
+  // Completions for the shared prompts and resource templates (the SDK refuses the
+  // handler unless the capability above is declared)
+  if (!NO_COMPLETIONS) {
+    server.setRequestHandler(CompleteRequestSchema, async (request) => {
+      await maybeDelay();
+      if (shouldFail()) {
+        throw new Error('Simulated failure');
+      }
+
+      const { ref, argument, context } = request.params;
+      const result = completeTestArgument(ref, argument, context);
+      if (!result) {
+        throw new Error(`Nothing to complete for ${JSON.stringify(ref)} argument ${argument.name}`);
+      }
+      return result;
+    });
+  }
+
   return server;
 }
 
@@ -450,6 +490,11 @@ async function main() {
         if (action === 'get-active-sessions') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ activeSessions: Array.from(transports.keys()) }));
+          return;
+        }
+        if (action === 'get-client-capabilities') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ capabilities: lastClientCapabilities }));
           return;
         }
         if (action === 'get-subscriptions') {
@@ -493,6 +538,7 @@ async function main() {
           sessionExpired = false;
           deletedSessions.length = 0;
           counterValue = 0;
+          lastClientCapabilities = null;
           res.writeHead(200);
           res.end('State reset');
           return;
@@ -568,6 +614,11 @@ async function main() {
       if (!auth || !auth.startsWith('Bearer ')) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+      if (EXPECTED_BEARER_TOKEN && auth.slice('Bearer '.length) !== EXPECTED_BEARER_TOKEN) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: unexpected token' }));
         return;
       }
     }
@@ -649,8 +700,9 @@ async function main() {
     if (NO_TOOLS) console.log(`  Tools: DISABLED`);
     if (NO_RESOURCES) console.log(`  Resources: DISABLED`);
     if (NO_PROMPTS) console.log(`  Prompts: DISABLED`);
+    if (NO_COMPLETIONS) console.log(`  Completions: DISABLED`);
     if (WITH_SKILLS) {
-      console.log(`  Skills: ENABLED${SKILLS_NO_INDEX ? ' (index OFF, fallback only)' : ''}`);
+      console.log(`  Skills: resources only (the extension's methods are 2026-07-28-only)`);
     }
   });
 

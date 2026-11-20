@@ -14,12 +14,14 @@ import {
   CreateMcpClientOptions,
   buildClientCapabilities,
   tasksUnsupportedByServerMessage,
+  isUnknownTaskError,
 } from '../core/index.js';
 import type { McpClient } from '../core/index.js';
 import type {
   ServerConfig,
   IpcMessage,
   LoggingLevel,
+  CompleteRequestParams,
   X402SchemePreference,
   ServerDetails,
 } from '../lib/index.js';
@@ -49,11 +51,11 @@ import {
   AuthError,
   isAuthenticationError,
 } from '../lib/index.js';
-import { getSession, loadSessions, updateSession } from '../lib/sessions.js';
+import { getSession, loadSessions, modifySession, updateSession } from '../lib/sessions.js';
 import type { AuthCredentials, X402WalletCredentials } from '../lib/types.js';
 import { OAuthTokenManager } from '../lib/auth/oauth-token-manager.js';
-import { OAuthProvider } from '../lib/auth/oauth-provider.js';
-import type { OAuthClientProvider } from '@modelcontextprotocol/client';
+import { createRuntimeAuthProvider } from '../lib/auth/runtime-auth-provider.js';
+import type { AuthProvider, OAuthClientProvider } from '@modelcontextprotocol/client';
 import {
   storeKeychainOAuthTokenInfo,
   readKeychainOAuthTokenInfo,
@@ -63,10 +65,10 @@ import {
 import { updateAuthProfileRefreshedAt } from '../lib/auth/profiles.js';
 import { createClientCredentialsProvider } from '../lib/auth/client-credentials.js';
 import { createIdJagProvider } from '../lib/auth/id-jag.js';
-import type { Tool, Resource, Prompt, Task } from '@modelcontextprotocol/client';
+import type { Tool, Resource, Prompt } from '@modelcontextprotocol/client';
 import { ResourceSyncManager } from './resource-sync.js';
 import { isModernProtocolVersion } from '../core/protocol.js';
-import type { TaskUpdate } from '../lib/types.js';
+import type { AnyTask, DetachedToolCall, TaskUpdate, TasksPage } from '../lib/types.js';
 import { createRequire } from 'module';
 const { version: mcpcVersion } = createRequire(import.meta.url)('../../package.json') as {
   version: string;
@@ -86,6 +88,10 @@ import { IpcLineBuffer } from '../lib/ipc-line-buffer.js';
 
 // Maximum IPC buffer size (10 MB) — destroy socket if exceeded
 const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
+
+// How long a bridge waits before re-reading sessions.json to confirm that another
+// bridge has really taken over its session (see exitIfSuperseded).
+const SUPERSEDED_CONFIRM_DELAY_MILLIS = 1000;
 
 const logger = createLogger('bridge');
 
@@ -119,20 +125,17 @@ class BridgeProcess {
   // OAuth token manager (created when CLI sends auth credentials via IPC)
   private tokenManager: OAuthTokenManager | null = null;
 
-  // OAuth provider for SDK transport. Either mcpc's OAuthProvider (authorization-code
-  // runtime mode, wraps tokenManager) or an SDK client-credentials provider.
-  private authProvider: OAuthClientProvider | null = null;
-
-  // True when authProvider is a client-credentials provider — drives the
-  // `oauth-client-credentials` extension capability declaration on initialize.
-  private usesClientCredentials = false;
-
-  // True when authProvider is an enterprise-managed-authorization (id_jag) provider —
-  // drives the `enterprise-managed-authorization` extension capability declaration.
-  private usesIdJag = false;
+  // Auth provider for the SDK transport. Either mcpc's bearer-token provider
+  // (authorization-code grant: wraps tokenManager, refreshes on 401) or an SDK
+  // client-credentials / id-jag provider.
+  private authProvider: AuthProvider | OAuthClientProvider | null = null;
 
   // HTTP headers (received via IPC, stored in memory only)
   private headers: Record<string, string> | null = null;
+
+  // Environment variables for the stdio server (received via IPC, stored in memory only;
+  // never on this process's argv, where every local user could read them)
+  private env: Record<string, string> | null = null;
 
   // Bearer token the proxy server requires (received via IPC, stored in memory only).
   // Read by the CLI before spawn and sent over IPC — never read from the keychain here,
@@ -144,9 +147,6 @@ class BridgeProcess {
 
   // Shared payment signature cache — middleware reads/writes, bridge invalidates on payment-required results
   private x402PaymentCache: X402PaymentCache = { signature: null };
-
-  // Active async tasks (in-memory, also persisted to disk for crash recovery)
-  private activeTasks: Map<string, Task> = new Map();
 
   // Resource→file sync for resources-subscribe (created once the MCP client connects)
   private resourceSync: ResourceSyncManager | null = null;
@@ -214,6 +214,7 @@ class BridgeProcess {
     logger.debug(`  clientSecret: ${credentials.clientSecret ? 'present' : 'absent'}`);
     logger.debug(`  privateKey: ${credentials.privateKeyPem ? 'present' : 'absent'}`);
     logger.debug(`  headers: ${credentials.headers ? Object.keys(credentials.headers).length : 0}`);
+    logger.debug(`  env: ${credentials.env ? Object.keys(credentials.env).length : 0}`);
     logger.debug(`  proxyBearerToken: ${credentials.proxyBearerToken ? 'present' : 'absent'}`);
     logger.debug(`  idJag: ${credentials.idJag ? 'present' : 'absent'}`);
 
@@ -249,7 +250,6 @@ class BridgeProcess {
           },
         },
       });
-      this.usesIdJag = true;
       logger.debug('Enterprise-managed authorization (id-jag) provider created for SDK transport');
     } else if (credentials.oauthGrant === 'client_credentials' && credentials.clientId) {
       // Client-credentials grant: build the SDK provider that fetches + refreshes
@@ -261,8 +261,10 @@ class BridgeProcess {
         ...(credentials.keyAlg ? { keyAlg: credentials.keyAlg } : {}),
         ...(credentials.scope ? { scope: credentials.scope } : {}),
         ...(credentials.tokenEndpoint ? { tokenEndpoint: credentials.tokenEndpoint } : {}),
+        ...(credentials.clientCredentialsIssuer
+          ? { issuer: credentials.clientCredentialsIssuer }
+          : {}),
       });
-      this.usesClientCredentials = true;
       logger.debug('Client-credentials provider created for SDK transport');
       // Set up OAuth token manager if refresh token and client ID are provided
     } else if (credentials.refreshToken && credentials.clientId) {
@@ -272,6 +274,7 @@ class BridgeProcess {
         clientId: credentials.clientId,
         ...(credentials.clientSecret ? { clientSecret: credentials.clientSecret } : {}),
         ...(credentials.oauthIssuer ? { issuer: credentials.oauthIssuer } : {}),
+        ...(credentials.oauthResource ? { resource: credentials.oauthResource } : {}),
         refreshToken: credentials.refreshToken,
         // Reload tokens from keychain before refresh (handles token rotation by other processes)
         onBeforeRefresh: async () => {
@@ -333,14 +336,11 @@ class BridgeProcess {
       });
       logger.debug('OAuth token manager initialized');
 
-      // Create auth provider for SDK transport (enables automatic token refresh)
-      this.authProvider = new OAuthProvider({
-        serverUrl: credentials.serverUrl,
-        profileName: credentials.profileName,
-        tokenManager: this.tokenManager,
-        clientId: credentials.clientId,
-      });
-      logger.debug('OAuthProvider created for SDK transport (runtime mode)');
+      // Auth provider for the SDK transport: hands it a valid token before every
+      // request and refreshes the token when the server answers 401 anyway, so the
+      // transport can retry (#395).
+      this.authProvider = createRuntimeAuthProvider(this.tokenManager);
+      logger.debug('Bearer-token auth provider created for SDK transport');
     } else if (credentials.refreshToken && !credentials.clientId) {
       logger.warn('Refresh token provided but client ID is missing - token refresh will not work');
     } else if (credentials.accessToken && !credentials.refreshToken) {
@@ -360,6 +360,12 @@ class BridgeProcess {
         ...credentials.headers,
       };
       logger.debug(`Stored headers "${Object.keys(this.headers).join(', ')}" in memory`);
+    }
+
+    // Store the stdio server's env if provided (merged into the transport config on connect)
+    if (credentials.env) {
+      this.env = { ...this.env, ...credentials.env };
+      logger.debug(`Stored stdio env "${Object.keys(this.env).join(', ')}" in memory`);
     }
 
     // Store the proxy bearer token if provided (used by startProxyServer)
@@ -693,6 +699,13 @@ class BridgeProcess {
       serverConfig = await this.updateTransportAuth();
     }
 
+    // A stdio server's env arrives over IPC (see setAuthCredentials); the config on argv
+    // never carries it.
+    if (this.env) {
+      serverConfig.env = { ...serverConfig.env, ...this.env };
+      logger.debug(`Added stdio env "${Object.keys(this.env).join(', ')}" to transport`);
+    }
+
     logger.debug('Building MCP client config...');
     logger.debug(`  this.authProvider is set: ${!!this.authProvider}`);
     logger.debug(`  this.x402Wallet is set: ${!!this.x402Wallet}`);
@@ -724,10 +737,7 @@ class BridgeProcess {
     const clientConfig: CreateMcpClientOptions = {
       clientInfo: { name: 'mcpc', version: mcpcVersion },
       serverConfig,
-      capabilities: buildClientCapabilities({
-        clientCredentials: this.usesClientCredentials,
-        enterpriseManagedAuth: this.usesIdJag,
-      }),
+      capabilities: buildClientCapabilities(),
       // Pass auth provider for automatic token refresh (HTTP transport only)
       ...(this.authProvider && { authProvider: this.authProvider }),
       // Pass session ID for resumption (HTTP transport only)
@@ -919,9 +929,10 @@ class BridgeProcess {
     }
     await updateSession(this.options.sessionName, sessionUpdate);
 
-    // Note: Token refresh is handled automatically by the SDK
-    // The SDK calls authProvider.tokens() before each request,
-    // which triggers OAuthTokenManager.getValidAccessToken() to refresh if needed
+    // Note: Token refresh is handled automatically by the SDK transport. It calls
+    // authProvider.token() before each request, which triggers
+    // OAuthTokenManager.getValidAccessToken() to refresh if needed, and
+    // authProvider.onUnauthorized() when the server rejects the token anyway.
 
     // Pre-populate tools cache (used by x402 proactive signing and listAllTools IPC method)
     if (serverDetails.capabilities?.tools) {
@@ -1034,6 +1045,9 @@ class BridgeProcess {
     if (instructions) {
       proxyOptions.instructions = instructions;
     }
+    if (serverDetails.capabilities) {
+      proxyOptions.capabilities = serverDetails.capabilities;
+    }
 
     this.proxyServer = new ProxyServer(proxyOptions);
 
@@ -1077,12 +1091,69 @@ class BridgeProcess {
       return;
     }
 
+    if (await this.exitIfSuperseded()) {
+      return;
+    }
+
     logger.debug('Sending keepalive ping');
     await this.client.ping();
     logger.debug('Keepalive ping successful');
 
     // Update lastSeenAt on successful ping
     await this.updateLastSeenAt();
+  }
+
+  /**
+   * Exit when sessions.json has been re-pointed at another bridge for this session.
+   *
+   * The CLI replaces a bridge whenever it believes the old one is dead. When that belief
+   * is wrong (a timed-out `tasklist` on Windows reported every PID dead, #427) or two CLI
+   * processes restart the same session in parallel (#156), the superseded bridge is never
+   * told to exit: nothing references its PID anymore and its own keepalive pings keep
+   * succeeding, so it lives on — with its stdio server child — until the machine reboots.
+   * Checking on every keepalive tick whether this bridge is still the registered one
+   * closes that gap for every such race, present and future.
+   *
+   * Only a *different* PID counts. A missing one means a CLI cleared the field because it
+   * believed this bridge dead; the session's next use then registers a replacement, which
+   * lands here. The takeover is confirmed on a second read shortly after the first.
+   *
+   * @returns true when the bridge is shutting down because it was superseded
+   */
+  private async exitIfSuperseded(): Promise<boolean> {
+    const registeredPid = await this.readRegisteredPid();
+    if (registeredPid === undefined || registeredPid === process.pid) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, SUPERSEDED_CONFIRM_DELAY_MILLIS));
+    if (this.isShuttingDown) {
+      return true;
+    }
+    if ((await this.readRegisteredPid()) !== registeredPid) {
+      return false;
+    }
+    logger.warn(
+      `Another bridge (PID ${registeredPid}) is registered for this session; ` +
+        `exiting so this one (PID ${process.pid}) is not left orphaned`
+    );
+    // The replacement may have resumed this bridge's MCP session ID (restartBridge hands it
+    // over), so the server-side session is now its to end — no HTTP DELETE from here.
+    await this.shutdown({ terminateMcpSession: false });
+    return true;
+  }
+
+  /**
+   * The bridge PID sessions.json currently holds for this session; undefined when the
+   * field is unset or the file cannot be read (a read error is never grounds to exit).
+   */
+  private async readRegisteredPid(): Promise<number | undefined> {
+    try {
+      const session = await getSession(this.options.sessionName);
+      return session?.pid;
+    } catch (error) {
+      logger.debug('Failed to read the registered bridge PID:', error);
+      return undefined;
+    }
   }
 
   /**
@@ -1108,9 +1179,12 @@ class BridgeProcess {
    * "tool not found") since these should never cause session status changes. Only
    * transport-level errors (HTTP 401/403/404) should trigger auth/expiry detection.
    *
-   * For auth errors, if a token manager is available, we attempt to refresh the token
-   * before giving up. This handles transient auth failures (e.g., expired access token
-   * that can be refreshed) without unnecessarily killing the session.
+   * An auth error that reaches this point is final: on a 401 the SDK transport has
+   * already asked the auth provider to refresh the token and retried the request
+   * once (see runtime-auth-provider.ts), so either the refresh failed or the server
+   * rejects freshly minted tokens too. Refreshing again here would only report a
+   * spurious success — the stored token is still valid by the local clock — and
+   * leave the session looping instead of marked unauthorized.
    */
   private async handlePossibleExpiration(error: Error): Promise<void> {
     // ServerError wraps errors from mcp-client.ts methods. Check the original error
@@ -1144,19 +1218,6 @@ class BridgeProcess {
       logger.warn('Session appears to be expired, marking as expired and shutting down');
       status = 'expired';
     } else if (isAuthenticationError(error.message)) {
-      // If we have a token manager, try to refresh before giving up
-      if (this.tokenManager) {
-        try {
-          logger.info(
-            'Authentication error detected, attempting token refresh before giving up...'
-          );
-          await this.tokenManager.refreshAccessToken();
-          logger.info('Token refresh succeeded — session will recover on next request');
-          return;
-        } catch (refreshError) {
-          logger.warn('Token refresh also failed, marking session as unauthorized:', refreshError);
-        }
-      }
       logger.warn('Authentication rejected, marking session as unauthorized and shutting down');
       status = 'unauthorized';
     }
@@ -1482,32 +1543,21 @@ class BridgeProcess {
           const executeToolCall = async (): Promise<unknown> => {
             if (params.useTask) {
               if (params.detach) {
-                // Detached execution: start task and return task ID immediately
-                const taskUpdate = await client.callToolDetached(
+                // Detached execution: return as soon as the server has handed out a task
+                // (or, on 2026-07-28, the tool result when it created none)
+                const outcome = await client.callToolDetached(
                   params.name,
                   params.arguments,
                   params._meta
                 );
-                this.activeTasks.set(taskUpdate.taskId, {
-                  taskId: taskUpdate.taskId,
-                  status: taskUpdate.status,
-                  statusMessage: taskUpdate.statusMessage,
-                  createdAt: taskUpdate.createdAt ?? new Date().toISOString(),
-                  lastUpdatedAt: taskUpdate.lastUpdatedAt ?? new Date().toISOString(),
-                } as Task);
-                await this.persistActiveTask(taskUpdate.taskId, params.name);
-                return taskUpdate;
+                if (outcome.task) {
+                  await this.persistActiveTask(outcome.task.taskId, params.name);
+                }
+                return outcome;
               }
 
               // Task-augmented tool call: stream updates to requesting socket
               const onUpdate = (update: TaskUpdate): void => {
-                this.activeTasks.set(update.taskId, {
-                  taskId: update.taskId,
-                  status: update.status,
-                  statusMessage: update.statusMessage,
-                  createdAt: update.createdAt ?? new Date().toISOString(),
-                  lastUpdatedAt: update.lastUpdatedAt ?? new Date().toISOString(),
-                } as Task);
                 if (message.id) {
                   this.sendResponse(socket, {
                     type: 'task-update',
@@ -1529,30 +1579,68 @@ class BridgeProcess {
                   params._meta
                 );
               } finally {
-                for (const [tid, task] of this.activeTasks) {
-                  if (
-                    task.status === 'completed' ||
-                    task.status === 'failed' ||
-                    task.status === 'cancelled'
-                  ) {
-                    this.activeTasks.delete(tid);
-                    await this.removePersistedTask(tid).catch(() => {});
-                  }
-                }
                 if (taskId) {
-                  await this.removePersistedTask(taskId).catch(() => {});
+                  await this.releaseFinishedTask(taskId);
                 }
               }
             }
 
-            return client.callTool(params.name, params.arguments, params._meta);
+            // A 2026-07-28 server may turn a plain call into a task on its own; the client
+            // waits for it, and the record makes it recoverable should this bridge die first.
+            let createdTaskId: string | undefined;
+            const { wrappedOnUpdate } = this.persistActiveTaskOnCreate((update: TaskUpdate) => {
+              createdTaskId = update.taskId;
+            }, params.name);
+            try {
+              return await client.callTool(
+                params.name,
+                params.arguments,
+                params._meta,
+                wrappedOnUpdate
+              );
+            } finally {
+              if (createdTaskId) {
+                await this.releaseFinishedTask(createdTaskId);
+              }
+            }
           };
 
+          // A detached call answers with a wrapper — { task } or, when a 2026-07-28 server
+          // ran the tool synchronously, { result }. The payment-required check below looks
+          // at the tool result itself (a task is never a payment challenge), so unwrap for
+          // it; the settlement receipt goes on whichever of the two the call produced.
+          const detached = !!(params.useTask && params.detach);
+          const toolResultOf = (value: unknown): unknown =>
+            detached ? (value as DetachedToolCall | undefined)?.result : value;
+
           // Execute with automatic x402 payment retry on payment-required tool results
-          result = await executeToolCall();
-          const retry = await this.handlePaymentRequiredRetry(params.name, result, executeToolCall);
-          if (retry.handled) {
-            result = retry.result;
+          try {
+            result = await executeToolCall();
+            const retry = await this.handlePaymentRequiredRetry(
+              params.name,
+              toolResultOf(result),
+              executeToolCall
+            );
+            if (retry.handled) {
+              result = retry.result;
+            }
+          } finally {
+            // Hand the caller the x402 settlement receipt for this call. Runs on the error
+            // path too: the assignment is then discarded with the exception, but consuming
+            // the receipt is what keeps a call that failed after its payment settled from
+            // handing its receipt to the next call to the same tool. The slot stays empty
+            // without x402, so such a session never loads the (viem-backed) x402 module.
+            if (this.x402PaymentCache.lastSettlement) {
+              const { withSettlementReceipt, withSettlementReceiptOnDetachedCall } =
+                await import('../lib/x402/fetch-middleware.js');
+              result = detached
+                ? withSettlementReceiptOnDetachedCall(
+                    result as DetachedToolCall | undefined,
+                    this.x402PaymentCache,
+                    params.name
+                  )
+                : withSettlementReceipt(result, this.x402PaymentCache, params.name);
+            }
           }
           break;
         }
@@ -1632,6 +1720,24 @@ class BridgeProcess {
           break;
         }
 
+        case 'listSkills': {
+          const cursor = message.params as string | undefined;
+          result = await this.client.listSkills(cursor);
+          break;
+        }
+
+        case 'getSkill': {
+          const params = message.params as { uri: string };
+          result = await this.client.getSkill(params.uri);
+          break;
+        }
+
+        case 'readResourceDirectory': {
+          const params = message.params as { uri: string; cursor?: string };
+          result = await this.client.readResourceDirectory(params.uri, params.cursor);
+          break;
+        }
+
         case 'listPrompts': {
           const cursor = message.params as string | undefined;
           result = await this.client.listPrompts(cursor);
@@ -1641,6 +1747,12 @@ class BridgeProcess {
         case 'getPrompt': {
           const params = message.params as { name: string; arguments?: Record<string, string> };
           result = await this.client.getPrompt(params.name, params.arguments);
+          break;
+        }
+
+        case 'complete': {
+          const params = message.params as CompleteRequestParams;
+          result = await this.client.complete(params);
           break;
         }
 
@@ -1656,7 +1768,11 @@ class BridgeProcess {
 
         case 'listTasks': {
           const cursor = message.params as string | undefined;
-          result = await this.client.listTasks(cursor);
+          // The 2026-07-28 tasks extension has no tasks/list: a client can only follow the
+          // tasks it created, which is exactly the record this bridge keeps.
+          result = this.tracksTasksLocally()
+            ? await this.listTrackedTasks()
+            : await this.client.listTasks(cursor);
           break;
         }
 
@@ -1681,14 +1797,6 @@ class BridgeProcess {
         case 'pollTask': {
           const params = message.params as { taskId: string };
           const onUpdate = (update: TaskUpdate): void => {
-            // Track active task
-            this.activeTasks.set(update.taskId, {
-              taskId: update.taskId,
-              status: update.status,
-              statusMessage: update.statusMessage,
-              createdAt: update.createdAt ?? new Date().toISOString(),
-              lastUpdatedAt: update.lastUpdatedAt ?? new Date().toISOString(),
-            } as Task);
             // Send task update to requesting client
             if (message.id) {
               this.sendResponse(socket, {
@@ -1701,8 +1809,7 @@ class BridgeProcess {
           try {
             result = await this.client.pollTask(params.taskId, onUpdate);
           } finally {
-            this.activeTasks.delete(params.taskId);
-            await this.removePersistedTask(params.taskId).catch(() => {});
+            await this.releaseFinishedTask(params.taskId);
           }
           break;
         }
@@ -1739,39 +1846,95 @@ class BridgeProcess {
     }
   }
 
-  // --- Active task persistence for crash recovery (stored in sessions.json) ---
+  // --- Task record (stored in sessions.json) ---
+  //
+  // Every task this session creates is recorded when it is created. On 2025-11-25
+  // connections the record exists for crash recovery only: the server's `tasks/list` is
+  // the listing, so an entry is dropped once its result has been delivered. On 2026-07-28
+  // connections the tasks extension has no listing — a client can only follow the tasks
+  // it created — so the record is also what `tasks-list` shows there, and entries stay
+  // until the server no longer knows the task (`listTrackedTasks` prunes those).
+
+  /** Whether this connection's `tasks-list` is answered from the local record (2026-07-28). */
+  private tracksTasksLocally(): boolean {
+    return this.client?.getProtocolEra() === 'modern';
+  }
 
   /**
-   * Persist an active task to sessions.json for crash recovery
+   * The tasks this session created, as the server sees them now (`tasks/get` each), for
+   * `tasks-list` on 2026-07-28 connections. A task the server no longer knows — expired
+   * past its TTL, or lost with the server's state — is dropped from the record.
+   */
+  private async listTrackedTasks(): Promise<TasksPage> {
+    const client = this.client;
+    if (!client) {
+      throw new NetworkError('MCP client not connected');
+    }
+    client.assertTasksAvailable();
+    const session = await getSession(this.options.sessionName);
+    const entries = Object.values(session?.activeTasks ?? {}).sort((a, b) =>
+      a.createdAt.localeCompare(b.createdAt)
+    );
+    const tasks: AnyTask[] = [];
+    for (const entry of entries) {
+      try {
+        tasks.push(await client.getTask(entry.taskId));
+      } catch (error) {
+        // Only the server saying "no such task" is proof the task is gone. A timeout, an
+        // auth failure or a malformed answer says nothing about the task, and dropping
+        // the record on it would lose the session's only handle on a task that is still
+        // running — so those fail the listing instead.
+        if (!isUnknownTaskError(error)) throw error;
+        logger.info(
+          `Task ${entry.taskId} is no longer known to the server, dropping it from the record: ${(error as Error).message}`
+        );
+        await this.removePersistedTask(entry.taskId);
+      }
+    }
+    return { tasks };
+  }
+
+  /**
+   * A task's result has been delivered (or the wait for it ended): forget the task where
+   * the record serves crash recovery only, keep it where it is the listing (see above).
+   */
+  private async releaseFinishedTask(taskId: string): Promise<void> {
+    if (this.tracksTasksLocally()) return;
+    await this.removePersistedTask(taskId).catch(() => {});
+  }
+
+  /**
+   * Record a task this session created in sessions.json.
+   *
+   * One atomic edit under the sessions file lock, like `removePersistedTask`: requests run
+   * concurrently in this process, so a `tasks-list` pruning an expired task while a tool
+   * call records a new one must not overwrite each other's entry with a stale copy of the
+   * record — on 2026-07-28 connections that record is the session's only handle on a task.
    */
   private async persistActiveTask(taskId: string, toolName: string): Promise<void> {
     try {
-      const session = await getSession(this.options.sessionName);
-      const activeTasks = { ...session?.activeTasks };
-      activeTasks[taskId] = {
-        taskId,
-        toolName,
-        createdAt: new Date().toISOString(),
-      };
-      await updateSession(this.options.sessionName, { activeTasks });
+      await modifySession(this.options.sessionName, (session) => ({
+        activeTasks: {
+          ...session.activeTasks,
+          [taskId]: { taskId, toolName, createdAt: new Date().toISOString() },
+        },
+      }));
     } catch (error) {
       logger.warn(`Failed to persist active task ${taskId}:`, error);
     }
   }
 
   /**
-   * Remove a persisted task (on completion/failure/cancellation)
+   * Remove a persisted task (on completion/failure/cancellation, or when the server no
+   * longer knows it). Atomic, see `persistActiveTask`.
    */
   private async removePersistedTask(taskId: string): Promise<void> {
     try {
-      const session = await getSession(this.options.sessionName);
-      if (session?.activeTasks?.[taskId]) {
-        const activeTasks = { ...session.activeTasks };
-        delete activeTasks[taskId];
-        await updateSession(this.options.sessionName, {
-          activeTasks: Object.keys(activeTasks).length > 0 ? activeTasks : {},
-        });
-      }
+      await modifySession(this.options.sessionName, (session) => {
+        if (!session.activeTasks?.[taskId]) return undefined;
+        const { [taskId]: _removed, ...activeTasks } = session.activeTasks;
+        return { activeTasks };
+      });
     } catch (error) {
       logger.warn(`Failed to remove persisted task ${taskId}:`, error);
     }
@@ -1847,8 +2010,11 @@ class BridgeProcess {
 
   /**
    * Gracefully shutdown the bridge
+   *
+   * @param options.terminateMcpSession - Whether to end the server-side MCP session (HTTP
+   *   DELETE) on the way out. Defaults to true; false when another bridge owns it now.
    */
-  private async shutdown(): Promise<void> {
+  private async shutdown(options?: { terminateMcpSession?: boolean }): Promise<void> {
     if (this.isShuttingDown) {
       return;
     }
@@ -1856,7 +2022,7 @@ class BridgeProcess {
 
     logger.info('Shutting down bridge...');
 
-    await this.cleanup();
+    await this.cleanup(options);
 
     process.exit(0);
   }
@@ -1864,7 +2030,7 @@ class BridgeProcess {
   /**
    * Clean up resources
    */
-  private async cleanup(): Promise<void> {
+  private async cleanup(options?: { terminateMcpSession?: boolean }): Promise<void> {
     // Stop keepalive ping
     if (this.keepaliveInterval) {
       clearInterval(this.keepaliveInterval);
@@ -1916,7 +2082,7 @@ class BridgeProcess {
     // Close MCP client
     if (this.client) {
       try {
-        await this.client.close();
+        await this.client.close({ terminateSession: options?.terminateMcpSession ?? true });
         logger.debug('MCP client closed');
       } catch (error) {
         logger.warn('Failed to close MCP client:', error);
@@ -1942,7 +2108,7 @@ async function main(): Promise<void> {
 
   if (args.length < 2) {
     console.error(
-      'Usage: mcpc-bridge <sessionName> <transportConfigJson> [--verbose] [--profile <name>] [--proxy-host <host>] [--proxy-port <port>] [--mcp-session-id <id>] [--protocol-version <version>] [--x402 <auto|upto|exact>] [--insecure]'
+      'Usage: node dist/bridge/index.js <sessionName> <transportConfigJson> [--verbose] [--profile <name>] [--proxy-host <host>] [--proxy-port <port>] [--mcp-session-id <id>] [--protocol-version <version>] [--x402 <auto|upto|exact>] [--insecure]'
     );
     process.exit(1);
   }

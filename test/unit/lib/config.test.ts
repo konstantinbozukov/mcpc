@@ -10,6 +10,7 @@ import {
   validateServerConfig,
   listServers,
   isStdioEntry,
+  listEnvVarReferences,
   getStandardMcpConfigPaths,
   discoverMcpConfigFiles,
   scanMcpConfigFiles,
@@ -128,6 +129,18 @@ describe('getServerConfig', () => {
     expect(() => getServerConfig(config, 'non-existent')).toThrow(
       'Server "non-existent" not found'
     );
+  });
+
+  it('should not resolve names inherited from Object.prototype', () => {
+    expect(() => getServerConfig(config, 'constructor')).toThrow('Server "constructor" not found');
+    expect(() => getServerConfig(config, '__proto__')).toThrow('Server "__proto__" not found');
+  });
+
+  it('should keep a "__proto__" env variable as an own property', () => {
+    const withProto = {
+      mcpServers: { s: { command: 'node', env: JSON.parse('{"__proto__":"x","A":"1"}') } },
+    };
+    expect(Object.keys(getServerConfig(withProto, 's').env!)).toEqual(['__proto__', 'A']);
   });
 
   it('should list available servers in error message', () => {
@@ -311,6 +324,58 @@ describe('environment variable substitution', () => {
   });
 });
 
+describe('listEnvVarReferences', () => {
+  it('returns an empty list for an entry that reads no environment variables', () => {
+    expect(listEnvVarReferences({ url: 'https://example.com', headers: { 'X-A': '1' } })).toEqual(
+      []
+    );
+    expect(listEnvVarReferences({ command: 'node', args: ['server.js'], env: { A: 'x' } })).toEqual(
+      []
+    );
+  });
+
+  it('finds references in url and header values', () => {
+    expect(
+      listEnvVarReferences({
+        url: 'https://${HOST}/mcp',
+        headers: { Authorization: 'Bearer ${API_TOKEN}', 'X-Static': 'literal' },
+      })
+    ).toEqual(['HOST', 'API_TOKEN']);
+  });
+
+  it('finds references in command, args and env values', () => {
+    expect(
+      listEnvVarReferences({
+        command: '${NODE_BIN}',
+        args: ['--token=${GITHUB_TOKEN}'],
+        env: { GITHUB_PERSONAL_ACCESS_TOKEN: '${GITHUB_TOKEN}', DEBUG: '1' },
+      })
+    ).toEqual(['NODE_BIN', 'GITHUB_TOKEN']);
+  });
+
+  it('deduplicates and reports several references inside one value', () => {
+    expect(listEnvVarReferences({ headers: { X: '${A} ${B} ${A}' } })).toEqual(['A', 'B']);
+  });
+
+  it('ignores header names — only values are expanded', () => {
+    expect(listEnvVarReferences({ url: 'https://example.com', headers: { '${A}': 'v' } })).toEqual(
+      []
+    );
+  });
+
+  it('sees exactly what substitution expands (same pattern)', () => {
+    process.env.TEST_REF_VAR = 'resolved';
+    try {
+      const raw = { url: 'https://example.com', headers: { X: '${TEST_REF_VAR}' } };
+      expect(listEnvVarReferences(raw)).toEqual(['TEST_REF_VAR']);
+      const substituted = getServerConfig({ mcpServers: { s: raw } }, 's');
+      expect(substituted.headers).toEqual({ X: 'resolved' });
+    } finally {
+      delete process.env.TEST_REF_VAR;
+    }
+  });
+});
+
 describe('getStandardMcpConfigPaths', () => {
   it('returns project-scoped paths first, then global', () => {
     const paths = getStandardMcpConfigPaths({
@@ -421,6 +486,21 @@ describe('getStandardMcpConfigPaths', () => {
     const pathStrs = paths.map((p) => p.path);
     const unique = new Set(pathStrs);
     expect(pathStrs.length).toBe(unique.size);
+  });
+
+  it('keeps the global scope for a user-level file that is also a project candidate', () => {
+    // From the home directory, `.cursor/mcp.json` is the user's own ~/.cursor/mcp.json — not a
+    // repository file — so it must not be treated as an untrusted project config.
+    const paths = getStandardMcpConfigPaths({
+      homeDir: '/home/alice',
+      cwd: '/home/alice',
+      platform: 'linux',
+    });
+    const cursor = paths.find((p) => p.path === '/home/alice/.cursor/mcp.json');
+    expect(cursor?.scope).toBe('global');
+    // A location that exists only in the project list stays project-scoped.
+    const projectOnly = paths.find((p) => p.path === '/home/alice/.mcp.json');
+    expect(projectOnly?.scope).toBe('project');
   });
 });
 
