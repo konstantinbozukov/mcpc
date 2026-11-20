@@ -31,7 +31,13 @@ or workflows), also update the built-in agent skill at [`skills/mcpc/SKILL.md`](
 
 If your change touches any help text, regenerate [`docs/REFERENCE.md`](./docs/REFERENCE.md) with
 `pnpm run build:reference` and commit it — it is captured verbatim from `mcpc --help` and
-`mcpc help <command>`, and CI fails when it has drifted (`pnpm run check:reference`).
+`mcpc help <command>`, and the unit tests fail when it has drifted (`pnpm run check:reference`
+runs the same check on its own).
+
+If your change touches the "MCP CLI clients" table in the README's "Related work" section,
+regenerate the comparison image with `node scripts/generate-related-work-image.mjs` (also part of
+`pnpm run build:readme`) and commit [`docs/images/related-work.svg`](./docs/images/related-work.svg)
+— it is rendered from that table, and the unit tests fail when it has drifted.
 
 ## Development setup
 
@@ -57,8 +63,8 @@ pnpm link --global
 mcpc --help
 ```
 
-As a supply-chain hardening measure, `pnpm-workspace.yaml` sets `minimumReleaseAge: 4320`, so newly
-published third-party packages aren't installed until they're at least 3 days old. If a fresh
+As a supply-chain hardening measure, `pnpm-workspace.yaml` sets `minimumReleaseAge: 5760`, so newly
+published third-party packages aren't installed until they're at least 4 days old. If a fresh
 dependency bump seems "stuck," that's why — wait it out, or add a targeted exclusion in
 `minimumReleaseAgeExclude` if you have a justified reason.
 
@@ -124,7 +130,7 @@ provenance), and GitHub release creation.
 
 ## Architecture
 
-The codebase is a single TypeScript package with three internal modules:
+The codebase is a single TypeScript package with four internal modules:
 
 ```
 src/
@@ -140,7 +146,7 @@ in the OS keychain via [`@napi-rs/keyring`](https://www.npmjs.com/package/@napi-
 `0600` file fallback on headless systems.
 
 For a deeper walkthrough of the protocol implementation, session lifecycle, error recovery, and
-security model, see [`CLAUDE.md`](./CLAUDE.md) — it's the reference document maintained for AI
+security model, see [`AGENTS.md`](./AGENTS.md) — it's the reference document maintained for AI
 coding agents, but it's plain Markdown and useful to humans too.
 
 ## References

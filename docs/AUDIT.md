@@ -1,5 +1,24 @@
 # Repository audit
 
+## Post-sync status (2026-11-19)
+
+Fork `main` was synced to [apify/mcpc](https://github.com/apify/mcpc) `main` at commit `7aac80efd36d4f83851a9baa364ed92400ce5ec8` (`package.json` version `0.8.0`, npm `latest` `0.8.0`, plus post-tag fixes `#479` OAuth `state` CSRF verification and `#491` repeated `connect -H` headers). Fork-specific agent notes live in `docs/FORK.md`; contributor guidance is upstream `AGENTS.md`.
+
+| Original audit item | After sync |
+| --- | --- |
+| MCP client `2.0.0` / SDK `^1.30.0` (GHSA-6qxp-vccf-f47h and related) | **Closed** — pins are client/core `2.3.1`, SDK `^1.32.1`. Re-run `pnpm audit --prod` when validating. |
+| Finding 1: project config env expansion on auto-discovery | **Closed** upstream `0.7.0` (`#383`). |
+| Finding 2: stdio `env` on bridge argv / logs | **Closed** upstream `0.8.0` (`#341`, `#431`). |
+| Finding 3: uncapped x402 spend / `MAX_UINT256` | **Still open** — track [apify/mcpc#372](https://github.com/apify/mcpc/pull/372). |
+| Finding 4: OAuth `state` not verified | **Closed** on synced `main` (`#479`), not in the `v0.8.0` tag alone. |
+| Finding 5: refresh without RFC 8707 `resource` | **Closed** upstream `0.7.0` (`#398`). |
+| Unreachable x402 `resource.url` (Konstantin PR) | **Still open upstream** — [apify/mcpc#396](https://github.com/apify/mcpc/pull/396). |
+| Findings 6–12 | **Not re-audited** on `0.8.0` / `7aac80e`; do not assume fixed. |
+
+Everything below documents the **pre-sync** tree unless stated otherwise.
+
+---
+
 Audit date: 13 November 2026. Tree: `konstantinbozukov/mcpc` commit `ab880f909662893accebe92c2b76408f2dfdf387` (`package.json` version `0.6.0`). No application code was changed for this audit. Line numbers refer to that commit.
 
 ## Summary

@@ -20,15 +20,20 @@ import type {
   ReadResourceResult,
   ListPromptsResult,
   GetPromptResult,
+  CompleteRequestParams,
+  CompleteResult,
   LoggingLevel,
   IMcpClient,
   ServerDetails,
   TaskUpdate,
-  GetTaskResult,
-  ListTasksResult,
-  CancelTaskResult,
+  AnyTask,
+  TasksPage,
+  DetachedToolCall,
   ResourceSyncResult,
   ResourceUnsubscribeResult,
+  ListSkillsResult,
+  GetSkillResult,
+  ReadResourceDirectoryResult,
 } from './types.js';
 import type { ListResourceTemplatesResult } from '@modelcontextprotocol/client';
 import { BridgeClient } from './bridge-client.js';
@@ -256,6 +261,42 @@ export class SessionClient implements IMcpClient {
     );
   }
 
+  async listSkills(cursor?: string): Promise<ListSkillsResult> {
+    return this.withRetry(
+      () =>
+        this.bridgeClient.request(
+          'listSkills',
+          cursor,
+          this.requestTimeoutSecs
+        ) as Promise<ListSkillsResult>,
+      'listSkills'
+    );
+  }
+
+  async getSkill(uri: string): Promise<GetSkillResult> {
+    return this.withRetry(
+      () =>
+        this.bridgeClient.request(
+          'getSkill',
+          { uri },
+          this.requestTimeoutSecs
+        ) as Promise<GetSkillResult>,
+      'getSkill'
+    );
+  }
+
+  async readResourceDirectory(uri: string, cursor?: string): Promise<ReadResourceDirectoryResult> {
+    return this.withRetry(
+      () =>
+        this.bridgeClient.request(
+          'readResourceDirectory',
+          { uri, ...(cursor ? { cursor } : {}) },
+          this.requestTimeoutSecs
+        ) as Promise<ReadResourceDirectoryResult>,
+      'readResourceDirectory'
+    );
+  }
+
   /**
    * Subscribe to a resource and keep a local file in sync with it.
    * The bridge performs an initial download to filePath and rewrites the file
@@ -315,6 +356,18 @@ export class SessionClient implements IMcpClient {
           this.requestTimeoutSecs
         ) as Promise<GetPromptResult>,
       'getPrompt'
+    );
+  }
+
+  async complete(params: CompleteRequestParams): Promise<CompleteResult> {
+    return this.withRetry(
+      () =>
+        this.bridgeClient.request(
+          'complete',
+          params,
+          this.requestTimeoutSecs
+        ) as Promise<CompleteResult>,
+      'complete'
     );
   }
 
@@ -423,20 +476,21 @@ export class SessionClient implements IMcpClient {
   }
 
   /**
-   * Call a tool in detached mode — returns task ID immediately without waiting
+   * Call a tool in detached mode — returns as soon as the server has handed out a task
+   * (or, on 2026-07-28 servers that decide against a task, the tool result itself)
    */
   async callToolDetached(
     name: string,
     args?: Record<string, unknown>,
     meta?: Record<string, unknown>
-  ): Promise<TaskUpdate> {
+  ): Promise<DetachedToolCall> {
     return this.withRetry(
       () =>
         this.bridgeClient.request(
           'callTool',
           { name, arguments: args, useTask: true, detach: true, ...(meta && { _meta: meta }) },
           this.requestTimeoutSecs
-        ) as Promise<TaskUpdate>,
+        ) as Promise<DetachedToolCall>,
       'callToolDetached',
       { idempotent: false }
     );
@@ -473,26 +527,26 @@ export class SessionClient implements IMcpClient {
     }, 'pollTask');
   }
 
-  async listTasks(cursor?: string): Promise<ListTasksResult> {
+  async listTasks(cursor?: string): Promise<TasksPage> {
     return this.withRetry(
       () =>
         this.bridgeClient.request(
           'listTasks',
           cursor,
           this.requestTimeoutSecs
-        ) as Promise<ListTasksResult>,
+        ) as Promise<TasksPage>,
       'listTasks'
     );
   }
 
-  async getTask(taskId: string): Promise<GetTaskResult> {
+  async getTask(taskId: string): Promise<AnyTask> {
     return this.withRetry(
       () =>
         this.bridgeClient.request(
           'getTask',
           { taskId },
           this.requestTimeoutSecs
-        ) as Promise<GetTaskResult>,
+        ) as Promise<AnyTask>,
       'getTask'
     );
   }
@@ -509,14 +563,14 @@ export class SessionClient implements IMcpClient {
     );
   }
 
-  async cancelTask(taskId: string): Promise<CancelTaskResult> {
+  async cancelTask(taskId: string): Promise<AnyTask> {
     return this.withRetry(
       () =>
         this.bridgeClient.request(
           'cancelTask',
           { taskId },
           this.requestTimeoutSecs
-        ) as Promise<CancelTaskResult>,
+        ) as Promise<AnyTask>,
       'cancelTask'
     );
   }

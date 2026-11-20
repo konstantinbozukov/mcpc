@@ -9,7 +9,8 @@ import { join, resolve } from 'path';
 import type { McpConfig, ServerConfig } from './types.js';
 import { ClientError } from './errors.js';
 import { createLogger } from './logger.js';
-import { normalizeServerUrl } from './utils.js';
+import { getOwnProperty, setOwnProperty } from './own-property.js';
+import { normalizeServerUrl, redactServerConfig } from './utils.js';
 
 const logger = createLogger('config');
 
@@ -81,7 +82,7 @@ export function loadConfig(configPath: string): McpConfig {
  * @throws ClientError if server name not found
  */
 export function getServerConfig(config: McpConfig, serverName: string): ServerConfig {
-  const serverConfig = config.mcpServers[serverName];
+  const serverConfig = getOwnProperty(config.mcpServers, serverName);
 
   if (!serverConfig) {
     const availableServers = Object.keys(config.mcpServers);
@@ -94,7 +95,8 @@ export function getServerConfig(config: McpConfig, serverName: string): ServerCo
   // Substitute environment variables
   const substituted = substituteEnvVars(serverConfig);
 
-  logger.debug(`Retrieved config for server: ${serverName}`, substituted);
+  // Header and env values are secrets more often than not — log the shape, not the values.
+  logger.debug(`Retrieved config for server: ${serverName}`, redactServerConfig(substituted));
 
   return substituted;
 }
@@ -146,6 +148,42 @@ function substituteEnvVars(config: ServerConfig): ServerConfig {
 }
 
 /**
+ * The `${VAR_NAME}` reference syntax. `substituteString` expands it; `listEnvVarReferences`
+ * reports it without expanding. Keep the two on the same pattern so an entry can never read a
+ * variable the trust check did not see.
+ */
+const ENV_VAR_REFERENCE_PATTERN = /\$\{([^}]+)}/g;
+
+/**
+ * List the environment variables a raw (unsubstituted) server entry references via `${VAR}`,
+ * across every field `substituteEnvVars` would expand: `url`, `command`, `args`, `env` and
+ * `headers`. Deduplicated, in order of first appearance. Empty when the entry reads nothing.
+ *
+ * Auto-discovery uses this to decide whether an entry from a project-scope config file (one
+ * checked into the current directory, possibly by someone else) may be connected: such a file
+ * is not trusted to read the environment, because `"headers": { "X": "${AWS_SECRET_ACCESS_KEY}" }`
+ * pointed at an attacker's URL would exfiltrate the secret on the first request.
+ */
+export function listEnvVarReferences(config: ServerConfig): string[] {
+  const values: string[] = [];
+  if (config.url !== undefined) values.push(config.url);
+  if (config.command !== undefined) values.push(config.command);
+  if (config.args !== undefined) values.push(...config.args);
+  if (config.env !== undefined) values.push(...Object.values(config.env));
+  if (config.headers !== undefined) values.push(...Object.values(config.headers));
+
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (typeof value !== 'string') continue;
+    for (const match of value.matchAll(ENV_VAR_REFERENCE_PATTERN)) {
+      const name = match[1];
+      if (name !== undefined) seen.add(name);
+    }
+  }
+  return [...seen];
+}
+
+/**
  * Track which environment variables have already been warned about
  * to avoid noisy repeated warnings (e.g., during bulk connect from config file).
  */
@@ -159,7 +197,7 @@ const warnedEnvVars = new Set<string>();
  * @returns String with substituted variables
  */
 function substituteString(str: string): string {
-  return str.replace(/\$\{([^}]+)}/g, (_match, varName: string) => {
+  return str.replace(ENV_VAR_REFERENCE_PATTERN, (_match, varName: string) => {
     const value = process.env[varName];
     if (value === undefined) {
       if (!warnedEnvVars.has(varName)) {
@@ -182,7 +220,7 @@ function substituteEnvObject(obj: Record<string, string>): Record<string, string
   const result: Record<string, string> = {};
 
   for (const [key, value] of Object.entries(obj)) {
-    result[key] = substituteString(value);
+    setOwnProperty(result, key, substituteString(value));
   }
 
   return result;
@@ -248,7 +286,7 @@ export function validateServerConfig(config: ServerConfig): boolean {
  * (i.e. has a `command` field rather than a `url`).
  */
 export function isStdioEntry(config: McpConfig, entryName: string): boolean {
-  return config.mcpServers[entryName]?.command !== undefined;
+  return getOwnProperty(config.mcpServers, entryName)?.command !== undefined;
 }
 
 // ----------------------------------------------------------------------------
@@ -350,14 +388,22 @@ export function getStandardMcpConfigPaths(options?: {
     );
   }
 
-  // Dedup by resolved absolute path (preserve order — first occurrence wins)
+  // Dedup by resolved absolute path (preserve order — first occurrence wins). A path that is
+  // both a project and a global location (running from the home directory makes
+  // `.cursor/mcp.json` and `~/.cursor/mcp.json` the same file) keeps the `global` scope: it is
+  // a user-level file the user authored, not one checked into a repository, and scope decides
+  // how much auto-discovery trusts it.
+  const globalPaths = new Set(
+    candidates.filter((c) => c.scope === 'global').map((c) => resolve(c.path))
+  );
   const seen = new Set<string>();
   const deduped: ConfigCandidate[] = [];
   for (const candidate of candidates) {
     const absolute = resolve(candidate.path);
     if (seen.has(absolute)) continue;
     seen.add(absolute);
-    deduped.push({ ...candidate, path: absolute });
+    const scope = globalPaths.has(absolute) ? 'global' : candidate.scope;
+    deduped.push({ ...candidate, path: absolute, scope });
   }
 
   return deduped;

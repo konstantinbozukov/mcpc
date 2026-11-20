@@ -5,15 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Each version opens with a one-line summary, which also opens its GitHub release.
+
 ## [Unreleased]
 
-### Added
-
-- New [REFERENCE.md](docs/REFERENCE.md) with the full `--help` output of every mcpc command, generated from the CLI itself so it always matches the release.
-- `mcpc @session` and `server-discover` now show the description and website URL a server advertises about itself, right below its name.
+Repeated `connect -H` headers are all sent again.
 
 ### Fixed
 
+- `connect` with several `-H`/`--header` options now stores and sends every header, not just the last one. (#490)
+
+## [0.8.0] - 2026-11-04
+
+Argument completions for prompts and resource templates, tasks on MCP 2026-07-28 servers, MCP TypeScript SDK 2.3.1, stdio server secrets kept out of plaintext files, logs and `ps`, and no more duplicate bridges on Windows.
+
+### Added
+
+- New `login --client-name <name>` registers the OAuth client under a name other than `mcpc` with Dynamic Client Registration, for authorization servers that show or check `client_name`. It disables CIMD, since the hosted document sets its own name.
+- New `completion-complete prompt|resource <ref> <arg:=val ...>` command asks the server for argument suggestions (MCP `completion/complete`): pass the arguments in the `prompts-get` syntax and the last one is completed. The `--proxy` server forwards completions too.
+- Support for the MCP [Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview) (`io.modelcontextprotocol/tasks`) on MCP 2026-07-28 servers: `tools-call --task`/`--detach`, `tasks-get`, `tasks-result` and `tasks-cancel` now work there too, mcpc declares the extension on every request, and a server that answers a plain `tools-call` with a task is followed to its result. `tasks-list` shows the tasks the session created, since the extension has no server-side listing. Everything keeps working unchanged on 2025-11-25 servers, where tasks are part of the core protocol. (#430)
+
+### Changed
+
+- Updated to MCP TypeScript SDK 2.3.1. Large tool results over Streamable HTTP now arrive in a fraction of the time, and HTTP redirects are followed only within the server's own origin (plus `http` to `https` on the same host): a server that redirects elsewhere is reported with the target URL so you can connect to it directly.
+- `tools-call --detach --json` prints the whole created `Task` object (id, status, TTL, poll interval) instead of just `{ taskId, status }`. On a 2026-07-28 server that runs a detached call synchronously — the server decides per call whether to create a task — it prints the tool result instead, so check for `taskId`.
+- `tasks-cancel` on a 2026-07-28 server reports the status the server shows right after acknowledging the request (cancellation is cooperative there, so a task may still be `working` for a moment) and exits with code 2 only when the task had already finished.
+
+### Security
+
+- `mcpc login` now verifies the OAuth `state` parameter: a callback on the local redirect port that does not echo the value this login sent is ignored, so another page open in the browser can neither abort the login nor slip its own authorization code into the profile. A pasted callback URL is checked the same way. The existing client registration is also kept until the new login has succeeded, so cancelling a `login` no longer breaks token refresh for the profile it was replacing.
+- The copy-paste `run: mcpc ...` hints no longer let a server-chosen name or URI run a command when pasted. Values containing a backslash followed by `$`, a backtick or `"` (for example `\$(id)`) were double-quoted without escaping the backslash, so a POSIX shell still expanded them. Backslashes are now escaped like the other characters that stay special inside double quotes. (GHSA-wmqm-r8wm-9f34)
+- `login --grant client-credentials` and `login --grant id-jag` now bind the stored client secret or key to the authorization server they were validated against, so a server that later points at a different authorization server is refused instead of receiving the credentials. Profiles created earlier keep working; log in again to bind them.
+- The `env` of a stdio config entry, where API tokens such as `GITHUB_PERSONAL_ACCESS_TOKEN` usually live, is now stored in the OS keychain and delivered to the bridge over IPC like session headers, instead of being written in plaintext to `sessions.json`, printed by `mcpc --json` and `mcpc @session`, and passed on the bridge's command line where `ps` showed it to every local user. Verbose output and the bridge log no longer record header values, env values, or tool-call arguments either, and bridge log files are created owner-only. (#341)
+- `skills-get` no longer accepts a `SKILL.md` that hides extra frontmatter under a `__proto__` key from the check against the skill's entry. Config entries, auth profiles, headers and schema checks also no longer mistake names like `__proto__` or `constructor` for built-in object properties. (GHSA-4qmw-95fx-fhvx)
+
+### Removed
+
+- The unused `mcpc-bridge` executable is no longer installed on your `PATH`. mcpc never invoked it — it starts the bridge process directly — so nothing changes for sessions.
+
+### Fixed
+
+- x402 payments no longer fail with "Unknown network" when a server lists a payment option on a chain mcpc cannot sign for (e.g. Solana) before the Base one: `x402 sign` and `--x402` sessions now pick the first option on a supported network. When there is none, the error lists what the server offered and which networks are supported.
+- `tools-call`, `prompts-get` and `completion-complete` no longer send arguments other than what you typed: a JSON array passed inline or on stdin is now rejected (MCP arguments must be an object), a `__proto__:=...` argument is no longer dropped, and a number too large to represent (e.g. `n:=1e400`) is kept as a string instead of being sent as `null`. (#448)
+- Bridge log rotation no longer races the file it rotates: under load the rename could run before the log file was opened or flushed, so the rotation was silently skipped and the first lines of the new file were lost.
+- Windows sessions no longer pile up duplicate bridge processes when `tasklist` is slow or unavailable. A liveness check that could not run used to report every bridge dead, so each command spawned a replacement without stopping the healthy original; the check now falls back to a signal probe, the old bridge is always asked to shut down, and a bridge that finds another one registered for its session exits on its own. (#427)
+- The `tools-get` call example now shows a real array or object (e.g. `[1]`, `{"x":1}`) for array and object arguments that have no default, including nullable ones and ones defined via `$ref`, instead of a string the server rejects.
+
+## [0.7.0] - 2026-09-23
+
+MCP Skills extension, directory resources, OAuth sessions that survive token expiry, and a round of security hardening.
+
+### Added
+
+- `skills-list` and `skills-get` now speak the MCP Skills extension as specified (`skills/list`, `skills/get`), replacing the earlier draft that discovered skills through a `skill://index.json` file. `skills-get` also reads a skill's supporting files (`mcpc @session skills-get <skill> references/FORMS.md`) and verifies everything it prints against the skill's published manifest — size, digest, and the SKILL.md frontmatter — so content that does not match is refused instead of shown. Requires a server on MCP 2026-07-28 or later that declares the extension.
+- New `resources-directory-read <uri>` command lists the direct children of a directory resource, for servers that declare `"directoryRead": true`.
+- `mcpc @session` now names every other [MCP extension](https://modelcontextprotocol.io/extensions/client-matrix) a server declares too, and says which of them mcpc can actually use, instead of dropping them from the capability list.
+- New [REFERENCE.md](docs/REFERENCE.md) with the full `--help` output of every mcpc command, generated from the CLI itself so it always matches the release.
+- `mcpc @session` and `server-discover` now show the description and website URL a server advertises about itself, right below its name.
+- x402 settlement receipts now reach the caller: a paid tool result carries the server's receipt at `_meta["x402/payment-response"]`, so a payment can be reconciled against its on-chain settlement instead of inferred from the tool output. The receipt used to be dropped when the server sent it as a `PAYMENT-RESPONSE` header. (#394)
+
+### Fixed
+
+- Session names auto-generated from config entries no longer keep leading or trailing underscores, so an entry named `_notion` becomes `@notion` instead of `@_notion`.
+- Human-readable `tools-call` and `tasks-result` output now hints when structured data is hidden behind other content and points to `--json` to retrieve the full result. A text block that merely serializes `structuredContent` is folded away whatever its JSON type, so a result carrying an array or a primitive is no longer printed twice. (#346)
 - `mcpc help tools/list` and other MCP method names now show the command's help instead of failing with "Unknown command" — they already worked as aliases everywhere else.
 - x402 payments now work against servers that only reveal a tool's price when it is called: the payment signed for such a challenge is attached to the retried call, which used to go out unpaid and return the payment-required result again. The signature stays scoped to the tools the server charges for, so calls to free tools never carry a payment.
 - Sessions no longer get stuck reconnecting forever after a server upgrades to MCP 2026-07-28: a reconnect replayed the stored session ID, which made the client skip protocol negotiation and the server reject every request. Stale session IDs are now dropped (2026-07-28 has no session resumption), and a session whose server no longer speaks its protocol version is marked expired with a hint to run `restart`.
@@ -22,13 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Confidential-client sessions now also refresh against authorization servers that accept only HTTP Basic client authentication. The refresh presents the client secret the way the login did and retries with the other form if the server rejects it. (#387)
 - Sessions no longer lose their saved OAuth refresh token when a server that does not rotate refresh tokens omits `refresh_token` from the refresh response. The bridge used to overwrite the stored token with nothing, so the session could not authenticate after the access token expired and required a new `mcpc login`.
 - Accented text, CJK characters, and emoji in large tool results are no longer corrupted in transit: a multibyte character that landed on a socket chunk boundary between the CLI and the bridge was replaced with `�`, and the JSON stayed valid so nothing reported an error. (#390)
+- Windows logins no longer fail with `Attribute 'password encoded as UTF-16' is longer than platform limit of 2560 chars`. A credential that Windows Credential Manager refuses to store in one entry — most OAuth token blobs — is now split across several, so `login` and background token refresh work with any token size. (#409)
+- Sessions authenticated with OAuth now survive the server rejecting an access token: the bridge refreshes the token and retries the request once, instead of failing with `OAuthProvider in runtime mode does not support authorization flow` until you ran `mcpc login` again. The refresh also sends the RFC 8707 `resource` indicator the login sent, which servers that bind tokens to a resource require. (#395)
 
 ### Changed
 
+- mcpc now tells every server that it supports the [OAuth client credentials](https://modelcontextprotocol.io/extensions/auth/oauth-client-credentials) and [enterprise-managed authorization](https://modelcontextprotocol.io/extensions/auth/enterprise-managed-authorization) extensions, rather than only on connections already using those grants. Servers that gate access on what a client supports can now see it before any token is issued.
 - Updated bundled dependencies to their latest versions, which picks up security fixes in the HTTP stack (`undici`) and the OS keychain binding (`@napi-rs/keyring`).
 
 ### Security
 
+- `skills-get --json` now returns only the content item it verified against the skill's manifest. A server whose `resources/read` answer carried extra items had them printed unverified alongside the verified one, under the same `contents` key an agent reads.
+- `skills-get` no longer hangs on a `SKILL.md` whose frontmatter has a long run of spaces inside a field name (the frontmatter parser walked such a line in quadratic time), and frontmatter nested deeper than 32 levels or indented inconsistently is now refused with a parse error instead of crashing or being silently truncated. The depth limit now also holds for a frontmatter that alternates `- key:` list items and nested lists, which used to slip past it and crash the CLI with a stack overflow.
+- The next-step hints printed by `skills-get`, `resources-directory-read` and `resources-read` now shell-quote the skill name and resource URIs they suggest running. Those values come from the server, so a skill named `pdf; curl … | sh #` used to yield a hint that ran the injected command when pasted or followed by an agent.
+- A bare `mcpc connect` no longer lets config files found in the current directory read environment variables. A `.mcp.json` checked into a repository could reference `${GITHUB_TOKEN}` in a header or hostname pointed at an attacker's server, and auto-discovery would have sent the secret on the first request. Such entries are now skipped with the variable names shown, `-H` is refused for auto-discovery (it would go to every discovered server), and connecting the file by name (`mcpc connect ./.mcp.json`) remains the explicit way to trust it. Config files under your home directory are unaffected.
 - Token refresh now goes only to the authorization server the profile logged in at, which `mcpc login` records, and never to a plaintext HTTP token endpoint. It used to re-resolve the server from the MCP server's metadata on every refresh, so a compromised server could point a session's refresh token and client secret at a server of its choosing. Profiles created before this release are pinned the next time you run `mcpc login`. (#387)
 - `mcpc login` no longer opens the authorization URL through `cmd.exe` on Windows. The URL comes from the authorization server, and `cmd.exe` treated `&`, `|`, `^` and `%VAR%` inside it as commands, so a malicious or compromised server could run arbitrary commands when you pressed Enter to open the browser (and even a benign URL was cut off at its first `&`). The browser is now launched without any shell on all platforms, and authorization URLs with a scheme other than `http:`/`https:` are refused.
 
@@ -431,7 +492,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive shell mode
 - JSON output mode for scripting
 
-[Unreleased]: https://github.com/apify/mcpc/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/apify/mcpc/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/apify/mcpc/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/apify/mcpc/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/apify/mcpc/compare/v0.5.0...v0.6.0
 [0.5.1]: https://github.com/apify/mcpc/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/apify/mcpc/compare/v0.4.0...v0.5.0

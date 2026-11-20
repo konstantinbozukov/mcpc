@@ -19,7 +19,11 @@ import {
 import { withFileLock } from './file-lock.js';
 import { createLogger } from './logger.js';
 import { ClientError } from './errors.js';
-import { removeKeychainSessionHeaders, removeKeychainProxyBearerToken } from './auth/keychain.js';
+import {
+  removeKeychainSessionHeaders,
+  removeKeychainSessionEnv,
+  removeKeychainProxyBearerToken,
+} from './auth/keychain.js';
 
 const logger = createLogger('sessions');
 
@@ -162,14 +166,31 @@ export async function saveSession(
   );
 }
 
+/** The fields of a session that `updateSession` and `modifySession` may change. */
+export type SessionUpdates = Partial<Omit<SessionData, 'name' | 'createdAt'>>;
+
 /**
  * Update specific fields of an existing session
  * @param sessionName - Name of the session (without @ prefix)
  * @param updates - Partial session data to update
  */
-export async function updateSession(
+export async function updateSession(sessionName: string, updates: SessionUpdates): Promise<void> {
+  return modifySession(sessionName, () => updates);
+}
+
+/**
+ * Update an existing session from its current state, atomically. `mutate` runs under the
+ * sessions file lock with the session as stored at that moment and returns the fields to
+ * change — or `undefined` to leave the session as it is — so two concurrent edits of the
+ * same field compose: a task record one request prunes while another extends it keeps
+ * both edits, where reading the session, editing the copy and calling `updateSession`
+ * would let the last writer replace the other's snapshot.
+ * @param sessionName - Name of the session (without @ prefix)
+ * @param mutate - Computes the update from the stored session
+ */
+export async function modifySession(
   sessionName: string,
-  updates: Partial<Omit<SessionData, 'name' | 'createdAt'>>
+  mutate: (current: SessionData) => SessionUpdates | undefined
 ): Promise<void> {
   const filePath = getSessionsFilePath();
   return withFileLock(
@@ -180,6 +201,12 @@ export async function updateSession(
       const existingSession = storage.sessions[sessionName];
       if (!existingSession) {
         throw new ClientError(`Session not found: ${sessionName}`);
+      }
+
+      const updates = mutate(existingSession);
+      if (updates === undefined) {
+        logger.debug(`Session ${sessionName} left unchanged`);
+        return;
       }
 
       // Merge updates (shallow merge for most fields)
@@ -237,6 +264,14 @@ export async function deleteSession(sessionName: string): Promise<void> {
         logger.debug(`Deleted headers from keychain for session: ${sessionName}`);
       } catch {
         // Ignore errors - headers may not exist
+      }
+
+      // Delete the stdio server's env from keychain (if any)
+      try {
+        await removeKeychainSessionEnv(sessionName);
+        logger.debug(`Deleted stdio env from keychain for session: ${sessionName}`);
+      } catch {
+        // Ignore errors - env may not exist
       }
 
       // Delete proxy bearer token from keychain (if any)
@@ -322,6 +357,14 @@ export async function consolidateSessions(
             logger.debug(`Deleted headers from keychain for session: ${name}`);
           } catch {
             // Ignore errors - headers may not exist
+          }
+
+          // Delete the stdio server's env from keychain (if any)
+          try {
+            await removeKeychainSessionEnv(name);
+            logger.debug(`Deleted stdio env from keychain for session: ${name}`);
+          } catch {
+            // Ignore errors - env may not exist
           }
 
           // Delete proxy bearer token from keychain (if any)

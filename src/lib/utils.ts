@@ -9,13 +9,21 @@ import { homedir, tmpdir } from 'os';
 import { join, resolve, isAbsolute } from 'path';
 import { mkdir, access, constants, rename, lstat, chmod } from 'fs/promises';
 import { ClientError, ServerError } from './errors.js';
+import { setOwnProperty } from './own-property.js';
+import type { ServerConfig } from './types.js';
 
 /**
  * Safety cap on pages fetched by fetchAllPages(). Generous — real servers
  * paginate in the tens of pages; the cap only exists to bound a misbehaving
  * server that keeps handing out fresh cursors forever.
  */
-const MAX_PAGINATION_PAGES = 1000;
+/**
+ * Most pages a paginated list operation may span before mcpc gives up on the
+ * server. Also handed to the SDK client as `listMaxPages`, so the SDK's own
+ * page walk (its no-cursor list calls aggregate every page) stops at the same
+ * point instead of its default of 64.
+ */
+export const MAX_PAGINATION_PAGES = 1000;
 
 /**
  * Fetch every page of a paginated MCP list operation and collect the items.
@@ -336,14 +344,15 @@ const COMMON_HOST_PREFIXES = ['mcp.', 'api.', 'www.'];
 /**
  * Sanitize a string into a valid session name part (without @ prefix).
  * Replaces invalid characters with hyphens, collapses consecutive hyphens,
- * and trims leading/trailing hyphens. Truncates to 64 characters.
+ * and trims leading/trailing hyphens and underscores (e.g. `_notion` → `notion`).
+ * Truncates to 64 characters.
  */
 function sanitizeSessionName(raw: string): string {
   return raw
     .toLowerCase()
     .replace(/[^a-z0-9_-]/g, '-') // replace invalid chars with hyphens
     .replace(/-{2,}/g, '-') // collapse consecutive hyphens
-    .replace(/^-+|-+$/g, '') // trim leading/trailing hyphens
+    .replace(/^[-_]+|[-_]+$/g, '') // trim leading/trailing hyphens and underscores
     .slice(0, 64);
 }
 
@@ -537,11 +546,21 @@ export function truncate(str: string, maxLength: number, suffix = '...'): string
  * the underlying `OpenProcess()` succeeds for zombie processes whose
  * handles haven't been fully released. We use `tasklist` instead, with
  * a short-lived cache so one call covers all PID checks within 2 seconds.
+ *
+ * The answer fails open: when `tasklist` itself cannot be trusted (it timed out on a
+ * busy machine, or is not on PATH), the check falls back to `process.kill(pid, 0)`
+ * instead of reporting the PID dead. A false "dead" is the expensive mistake here —
+ * the CLI would spawn a replacement bridge and never stop the healthy one (#427) —
+ * while a false "alive" only costs a fast-failing socket connect before the restart.
  */
 export function isProcessAlive(pid: number): boolean {
   if (process.platform === 'win32') {
     return isProcessAliveTasklist(pid);
   }
+  return isProcessAliveSignal(pid);
+}
+
+function isProcessAliveSignal(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -559,7 +578,9 @@ export function isProcessAlive(pid: number): boolean {
  */
 let _tasklistCache: Set<number> | null = null;
 let _tasklistCacheTime = 0;
+let _tasklistFailedAt = 0;
 const TASKLIST_CACHE_TTL_MILLIS = 2000; // 2 seconds
+const TASKLIST_TIMEOUT_MILLIS = 10_000;
 
 /**
  * Invalidate the Windows tasklist cache used by isProcessAlive().
@@ -570,6 +591,7 @@ const TASKLIST_CACHE_TTL_MILLIS = 2000; // 2 seconds
 export function invalidateProcessAliveCache(): void {
   _tasklistCache = null;
   _tasklistCacheTime = 0;
+  _tasklistFailedAt = 0;
 }
 
 function isProcessAliveTasklist(pid: number): boolean {
@@ -577,12 +599,18 @@ function isProcessAliveTasklist(pid: number): boolean {
   if (_tasklistCache && now - _tasklistCacheTime < TASKLIST_CACHE_TTL_MILLIS) {
     return _tasklistCache.has(pid);
   }
+  // A tasklist that just failed is not retried within the TTL: one CLI invocation checks
+  // the same PID several times in a row (ensureBridgeReady, stopBridge, waitForProcessExit),
+  // and each retry of a timed-out tasklist would cost another full timeout.
+  if (_tasklistFailedAt && now - _tasklistFailedAt < TASKLIST_CACHE_TTL_MILLIS) {
+    return isProcessAliveSignal(pid);
+  }
   try {
     // Fetch ALL PIDs in one call (CSV format for reliable parsing)
     const output = execFileSync('tasklist', ['/FO', 'CSV', '/NH'], {
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 10000,
+      timeout: TASKLIST_TIMEOUT_MILLIS,
     });
     _tasklistCache = new Set<number>();
     for (const line of output.split('\n')) {
@@ -591,10 +619,13 @@ function isProcessAliveTasklist(pid: number): boolean {
       if (match) _tasklistCache.add(Number(match[1]));
     }
     _tasklistCacheTime = now;
+    _tasklistFailedAt = 0;
     return _tasklistCache.has(pid);
   } catch {
+    // tasklist timed out or could not run — its answer is unknown, not "dead" (#427).
     _tasklistCache = null;
-    return false;
+    _tasklistFailedAt = Date.now();
+    return isProcessAliveSignal(pid);
   }
 }
 
@@ -619,8 +650,26 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
   if (Object.keys(headers).length === 0) return headers;
   const redacted: Record<string, string> = {};
   for (const key of Object.keys(headers)) {
-    redacted[key] = REDACTED_HEADER_VALUE;
+    setOwnProperty(redacted, key, REDACTED_HEADER_VALUE);
   }
+  return redacted;
+}
+
+/**
+ * Redact every secret-bearing value of a server config for storage, display, or logging:
+ * HTTP `headers` and stdio `env` values become "<redacted>" (their keys stay, so a restart
+ * knows which values to fetch from the keychain). The real values live in the OS keychain.
+ *
+ * `command` and `args` are deliberately left alone: a stdio server's command line is the
+ * child process's own argv, which `ps` shows to every local user regardless of what mcpc
+ * stores, so hiding it here would cost diagnostics without protecting anything. Its
+ * environment, by contrast, is private to the process owner — until it is copied onto
+ * another process's command line or into a world-readable file, which is what this guards.
+ */
+export function redactServerConfig(config: ServerConfig): ServerConfig {
+  const redacted: ServerConfig = { ...config };
+  if (config.headers) redacted.headers = redactHeaders(config.headers);
+  if (config.env) redacted.env = redactHeaders(config.env);
   return redacted;
 }
 
@@ -726,9 +775,11 @@ export function enrichErrorMessage(errorMessage: string, serverUrl?: string): st
     return `Server returned 404 Not Found${urlHint}. Check the endpoint URL.\n  Original error: ${errorMessage}`;
   }
 
-  // HTTP redirects
+  // HTTP redirects. The SDK follows a redirect only within the server's origin (and
+  // http -> https on the same host); anything else is reported with its target so the
+  // user can connect to it directly, or notice the URL is not an MCP endpoint at all.
   if (isHttpRedirectError(errorMessage)) {
-    return `Server returned a redirect${urlHint}. This doesn't look like an MCP endpoint.\n  Original error: ${errorMessage}`;
+    return `Server returned a redirect${urlHint} that was not followed (redirects are only followed within the same origin, or from http to https on the same host). If the target is the MCP endpoint, connect to that URL directly; otherwise this doesn't look like an MCP endpoint.\n  Original error: ${errorMessage}`;
   }
 
   // Timeout
